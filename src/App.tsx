@@ -66,6 +66,7 @@ type PdfPageInfo = {
   pageNumber: number
   width: number
   height: number
+  hasImages?: boolean
 }
 
 type PdfTextRegion = {
@@ -76,6 +77,7 @@ type PdfTextRegion = {
   width: number
   height: number
   isMath: boolean
+  isVisual?: boolean
 }
 
 type Token =
@@ -349,27 +351,191 @@ async function extractTxt(file: File): Promise<ExtractedBook> {
 }
 
 async function extractPdf(file: File): Promise<ExtractedBook> {
-  const data = new Uint8Array(await file.arrayBuffer())
+  const buffer = await file.arrayBuffer()
+  const data = new Uint8Array(buffer.slice(0))
   const pdf = await pdfjsLib.getDocument({ data }).promise
-  const pages: string[] = []
+  const pages: PdfPageInfo[] = []
+  const regions: PdfTextRegion[] = []
+  let text = ''
+  let wordIndex = 0
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber)
+    const viewport = page.getViewport({ scale: 1 })
     const content = await page.getTextContent()
-    const pageText = content.items
-      .map((item) => ('str' in item ? item.str : ''))
-      .join(' ')
+    const operatorList = await page.getOperatorList()
+    const imageOps = new Set([
+      pdfjsLib.OPS.paintImageXObject,
+      pdfjsLib.OPS.paintInlineImageXObject,
+      pdfjsLib.OPS.paintXObject,
+    ])
 
-    if (pageText.trim()) {
-      pages.push(pageText)
+    pages.push({
+      pageNumber,
+      width: viewport.width,
+      height: viewport.height,
+      hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
+    })
+
+    if (text) {
+      text += '\n\n'
     }
+
+    content.items.forEach((item) => {
+      if (!('str' in item) || !item.str.trim()) return
+
+      if (text && !/\s$/.test(text)) {
+        text += ' '
+      }
+
+      const itemText = item.str.trim()
+      const transform = pdfjsLib.Util.transform(viewport.transform, item.transform)
+      const itemLeft = transform[4]
+      const itemTop = transform[5] - item.height
+      const itemWidth = Math.max(item.width, itemText.length * 2)
+      const itemHeight = Math.max(item.height, 8)
+      const mathItem = isProbablyMathText(itemText)
+
+      Array.from(itemText.matchAll(/\S+/g)).forEach((match) => {
+        const localStart = match.index ?? 0
+        const localEnd = localStart + match[0].length
+        const left = itemLeft + (itemWidth * localStart) / Math.max(itemText.length, 1)
+        const width = Math.max(
+          (itemWidth * (localEnd - localStart)) / Math.max(itemText.length, 1),
+          itemHeight * 0.4,
+        )
+
+        regions.push({
+          wordIndex,
+          pageNumber,
+          left,
+          top: Math.max(itemTop, 0),
+          width,
+          height: itemHeight,
+          isMath: mathItem || isProbablyMathText(match[0]),
+        })
+
+        wordIndex += 1
+      })
+
+      text += itemText
+      if ('hasEOL' in item && item.hasEOL) {
+        text += '\n'
+      }
+    })
+  }
+
+  const normalizedText = normalizeText(text)
+
+  if (!normalizedText) {
+    throw new Error('No readable text was found in this PDF.')
+  }
+
+  try {
+    await pdf.destroy()
+  } catch {
+    // PDF.js may have already released the document after extraction.
   }
 
   return {
     title: titleFromFileName(file.name),
     sourceType: 'pdf',
-    text: normalizeText(pages.join('\n\n')),
+    text: normalizedText,
+    pdfDataUrl: arrayBufferToDataUrl(buffer, file.type || 'application/pdf'),
+    pdfPages: pages,
+    pdfRegions: regions,
+    mathRegionCount: regions.filter((region) => region.isMath).length,
   }
+}
+
+function PdfPageView({
+  activeRegions,
+  onJump,
+  pageInfo,
+  pdfDocument,
+  registerActiveRegion,
+}: {
+  activeRegions: PdfTextRegion[]
+  onJump: (wordIndex: number) => void
+  pageInfo: PdfPageInfo
+  pdfDocument: PdfDocumentProxy
+  registerActiveRegion: (node: HTMLButtonElement | null) => void
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const [isRendered, setIsRendered] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function renderPage() {
+      const canvas = canvasRef.current
+
+      if (!canvas) return
+
+      setIsRendered(false)
+      const page = await pdfDocument.getPage(pageInfo.pageNumber)
+      const outputScale = Math.min(window.devicePixelRatio || 1, 2)
+      const viewport = page.getViewport({ scale: outputScale })
+      const context = canvas.getContext('2d')
+
+      if (!context || cancelled) return
+
+      canvas.width = viewport.width
+      canvas.height = viewport.height
+      canvas.style.aspectRatio = `${pageInfo.width} / ${pageInfo.height}`
+      await page.render({ canvas, canvasContext: context, viewport }).promise
+
+      if (!cancelled) {
+        setIsRendered(true)
+      }
+    }
+
+    void renderPage()
+
+    return () => {
+      cancelled = true
+    }
+  }, [pageInfo.height, pageInfo.pageNumber, pageInfo.width, pdfDocument])
+
+  return (
+    <section
+      className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
+      style={{ aspectRatio: `${pageInfo.width} / ${pageInfo.height}` }}
+      aria-label={`PDF page ${pageInfo.pageNumber}`}
+    >
+      <canvas ref={canvasRef} aria-hidden="true" />
+      <div className="pdf-page-number">Page {pageInfo.pageNumber}</div>
+      {activeRegions.map((region, index) => (
+        <button
+          type="button"
+          key={`${region.wordIndex}-${index}`}
+          ref={index === 0 ? registerActiveRegion : undefined}
+          className={[
+            'pdf-region',
+            'is-active',
+            region.isMath ? 'is-math' : '',
+            region.isVisual ? 'is-visual' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          style={{
+            left: `${(region.left / pageInfo.width) * 100}%`,
+            top: `${(region.top / pageInfo.height) * 100}%`,
+            width: `${(region.width / pageInfo.width) * 100}%`,
+            height: `${(region.height / pageInfo.height) * 100}%`,
+          }}
+          onClick={() => onJump(region.wordIndex)}
+          aria-label={
+            region.isVisual
+              ? 'Visual page pause region'
+              : region.isMath
+                ? 'Equation pause region'
+                : 'Current read region'
+          }
+        />
+      ))}
+    </section>
+  )
 }
 
 async function extractEpub(file: File): Promise<ExtractedBook> {
@@ -476,10 +642,15 @@ function App() {
   const [isDraggingFile, setIsDraggingFile] = useState(false)
   const [status, setStatus] = useState('Ready')
   const [query, setQuery] = useState('')
+  const [pdfDocument, setPdfDocument] = useState<PdfDocumentProxy | null>(null)
+  const [pdfRenderStatus, setPdfRenderStatus] = useState('')
+  const [visualPausePage, setVisualPausePage] = useState<number | null>(null)
   const readerRef = useRef<HTMLDivElement | null>(null)
   const activeWordRef = useRef<HTMLSpanElement | null>(null)
+  const activePdfRegionRef = useRef<HTMLButtonElement | null>(null)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const speakFromWordRef = useRef<(wordIndex: number) => void>(() => undefined)
+  const pausedImagePagesRef = useRef<Set<number>>(new Set())
   const resumeIndexRef = useRef(0)
   const isStoppingRef = useRef(false)
 
@@ -490,11 +661,104 @@ function App() {
   const minutesRemaining = estimateMinutesRemaining(words.length, currentWordIndex, settings.rate)
   const selectedVoice = voices.find((voice) => voice.voiceURI === settings.voiceURI) ?? voices[0]
   const filteredBookmarks = bookmarks.filter((bookmark) => bookmark.id.startsWith(`${book.id}:`))
+  const pdfRegionsByWord = useMemo(
+    () => new Map((book.pdfRegions ?? []).map((region) => [region.wordIndex, region])),
+    [book.pdfRegions],
+  )
+  const activePdfRegions = useMemo(() => {
+    if (visualPausePage) {
+      const pageInfo = book.pdfPages?.find((page) => page.pageNumber === visualPausePage)
+
+      if (pageInfo) {
+        return [
+          {
+            wordIndex: currentWordIndex,
+            pageNumber: pageInfo.pageNumber,
+            left: pageInfo.width * 0.06,
+            top: pageInfo.height * 0.06,
+            width: pageInfo.width * 0.88,
+            height: pageInfo.height * 0.88,
+            isMath: false,
+            isVisual: true,
+          },
+        ]
+      }
+    }
+
+    const region = pdfRegionsByWord.get(currentWordIndex)
+
+    if (!region) return []
+
+    if (!region.isMath) return [region]
+
+    const regions = [region]
+
+    for (let cursor = currentWordIndex + 1; cursor < words.length; cursor += 1) {
+      const nextRegion = pdfRegionsByWord.get(cursor)
+
+      if (!nextRegion?.isMath || nextRegion.pageNumber !== region.pageNumber) break
+      regions.push(nextRegion)
+    }
+
+    return regions
+  }, [book.pdfPages, currentWordIndex, pdfRegionsByWord, visualPausePage, words.length])
+  const isPdfVisualReader = book.sourceType === 'pdf' && !!pdfDocument && !!book.pdfPages?.length
   const searchMatchIndex = useMemo(() => {
     if (!query.trim()) return -1
 
     return book.text.toLowerCase().indexOf(query.toLowerCase())
   }, [book.text, query])
+
+  const isPdfMathWord = useCallback(
+    (wordIndex: number) => book.sourceType === 'pdf' && !!pdfRegionsByWord.get(wordIndex)?.isMath,
+    [book.sourceType, pdfRegionsByWord],
+  )
+
+  const findNextNarratablePdfWord = useCallback(
+    (startIndex: number) => {
+      for (let cursor = startIndex; cursor < words.length; cursor += 1) {
+        if (!isPdfMathWord(cursor)) return cursor
+      }
+
+      return words.length
+    },
+    [isPdfMathWord, words.length],
+  )
+
+  const buildPdfSpeechChunk = useCallback(
+    (startWordIndex: number) => {
+      const parts: string[] = []
+      const boundaryMap: Array<{ charStart: number; wordIndex: number }> = []
+      let charCursor = 0
+      let cursor = startWordIndex
+
+      while (
+        cursor < words.length &&
+        !isPdfMathWord(cursor) &&
+        parts.length < PDF_CHUNK_WORD_LIMIT
+      ) {
+        const word = words[cursor].text
+        const prefix = parts.length === 0 ? '' : ' '
+
+        boundaryMap.push({
+          charStart: charCursor + prefix.length,
+          wordIndex: cursor,
+        })
+        parts.push(word)
+        charCursor += prefix.length + word.length
+        cursor += 1
+
+        if (/[.!?]$/.test(word) && parts.length > 28) break
+      }
+
+      return {
+        boundaryMap,
+        nextWordIndex: cursor,
+        text: parts.join(' '),
+      }
+    },
+    [isPdfMathWord, words],
+  )
 
   const jumpToWord = useCallback((wordIndex: number) => {
     const safeWordIndex = Math.max(0, Math.min(wordIndex, Math.max(words.length - 1, 0)))
@@ -503,7 +767,8 @@ function App() {
     setStatus('Position updated')
 
     requestAnimationFrame(() => {
-      activeWordRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      const activeNode = activeWordRef.current ?? activePdfRegionRef.current
+      activeNode?.scrollIntoView({ behavior: 'smooth', block: 'center' })
     })
   }, [words.length])
 
@@ -530,6 +795,128 @@ function App() {
       window.speechSynthesis.cancel()
 
       const safeWordIndex = Math.max(0, Math.min(wordIndex, words.length - 1))
+
+      if (book.sourceType === 'pdf' && book.pdfRegions?.length) {
+        const currentRegion = pdfRegionsByWord.get(safeWordIndex)
+        const currentPage = currentRegion
+          ? book.pdfPages?.find((page) => page.pageNumber === currentRegion.pageNumber)
+          : undefined
+
+        if (
+          currentPage?.hasImages &&
+          !pausedImagePagesRef.current.has(currentPage.pageNumber)
+        ) {
+          pausedImagePagesRef.current.add(currentPage.pageNumber)
+          resumeIndexRef.current = safeWordIndex
+          setVisualPausePage(currentPage.pageNumber)
+          setCurrentWordIndex(safeWordIndex)
+          setIsSpeaking(true)
+          setIsPaused(false)
+          setStatus('Visual pause')
+
+          window.setTimeout(() => {
+            setVisualPausePage(null)
+            if (isStoppingRef.current) return
+            speakFromWordRef.current(safeWordIndex)
+          }, PDF_EQUATION_PAUSE_MS)
+
+          return
+        }
+
+        setVisualPausePage(null)
+
+        if (isPdfMathWord(safeWordIndex)) {
+          const nextWordIndex = findNextNarratablePdfWord(safeWordIndex + 1)
+
+          resumeIndexRef.current = safeWordIndex
+          setCurrentWordIndex(safeWordIndex)
+          setIsSpeaking(true)
+          setIsPaused(false)
+          setStatus('Equation pause')
+
+          window.setTimeout(() => {
+            if (isStoppingRef.current) return
+
+            if (nextWordIndex < words.length) {
+              speakFromWordRef.current(nextWordIndex)
+            } else {
+              setIsSpeaking(false)
+              setIsPaused(false)
+              setStatus('Finished')
+            }
+          }, PDF_EQUATION_PAUSE_MS)
+
+          return
+        }
+
+        const chunk = buildPdfSpeechChunk(safeWordIndex)
+
+        if (!chunk.text.trim()) {
+          const nextWordIndex = findNextNarratablePdfWord(safeWordIndex + 1)
+
+          if (nextWordIndex < words.length) {
+            speakFromWordRef.current(nextWordIndex)
+          } else {
+            setIsSpeaking(false)
+            setStatus('Finished')
+          }
+
+          return
+        }
+
+        const utterance = new SpeechSynthesisUtterance(chunk.text)
+        utterance.rate = settings.rate
+        utterance.pitch = settings.pitch
+        utterance.volume = settings.volume
+
+        if (selectedVoice) {
+          utterance.voice = selectedVoice
+          utterance.lang = selectedVoice.lang
+        }
+
+        utterance.onboundary = (event) => {
+          if (typeof event.charIndex !== 'number') return
+
+          const activeBoundary =
+            chunk.boundaryMap.findLast((boundary) => boundary.charStart <= event.charIndex) ??
+            chunk.boundaryMap[0]
+
+          if (!activeBoundary) return
+
+          resumeIndexRef.current = activeBoundary.wordIndex
+          setCurrentWordIndex(activeBoundary.wordIndex)
+        }
+
+        utterance.onend = () => {
+          if (isStoppingRef.current) return
+
+          if (chunk.nextWordIndex < words.length) {
+            speakFromWordRef.current(chunk.nextWordIndex)
+          } else {
+            setCurrentWordIndex(words.length - 1)
+            setIsSpeaking(false)
+            setIsPaused(false)
+            setStatus('Finished')
+          }
+        }
+
+        utterance.onerror = () => {
+          if (isStoppingRef.current) return
+          setIsSpeaking(false)
+          setIsPaused(false)
+          setStatus('Voice playback stopped')
+        }
+
+        utteranceRef.current = utterance
+        resumeIndexRef.current = safeWordIndex
+        setCurrentWordIndex(safeWordIndex)
+        setIsSpeaking(true)
+        setIsPaused(false)
+        setStatus('Reading PDF text')
+        window.speechSynthesis.speak(utterance)
+        return
+      }
+
       const startChar = words[safeWordIndex]?.start ?? 0
       const chunk = getChunk(book.text, startChar)
 
@@ -590,7 +977,14 @@ function App() {
       window.speechSynthesis.speak(utterance)
     },
     [
+      book.pdfPages,
+      book.pdfRegions?.length,
+      book.sourceType,
       book.text,
+      buildPdfSpeechChunk,
+      findNextNarratablePdfWord,
+      isPdfMathWord,
+      pdfRegionsByWord,
       selectedVoice,
       settings.pitch,
       settings.rate,
@@ -604,7 +998,15 @@ function App() {
   }, [speakFromWord])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(book))
+    try {
+      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(book))
+    } catch {
+      if (!book.pdfDataUrl) return
+
+      const bookWithoutPdfBytes = { ...book }
+      delete bookWithoutPdfBytes.pdfDataUrl
+      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(bookWithoutPdfBytes))
+    }
   }, [book])
 
   useEffect(() => {
@@ -618,6 +1020,10 @@ function App() {
   useEffect(() => {
     persistProgress(currentWordIndex)
   }, [currentWordIndex, persistProgress])
+
+  useEffect(() => {
+    pausedImagePagesRef.current.clear()
+  }, [book.id])
 
   useEffect(() => {
     const updateVoices = () => {
@@ -643,10 +1049,49 @@ function App() {
   }, [settings.voiceURI])
 
   useEffect(() => {
-    if (!activeWordRef.current || !isSpeaking) return
+    const activeNode = activeWordRef.current ?? activePdfRegionRef.current
 
-    activeWordRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (!activeNode || !isSpeaking) return
+
+    activeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [currentWordIndex, isSpeaking])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadPdfDocument() {
+      if (book.sourceType !== 'pdf' || !book.pdfDataUrl) {
+        setPdfDocument(null)
+        setPdfRenderStatus('')
+        return
+      }
+
+      try {
+        setPdfRenderStatus('Loading rendered PDF')
+        const pdf = await pdfjsLib.getDocument({ data: await dataUrlToUint8Array(book.pdfDataUrl) })
+          .promise
+
+        if (cancelled) {
+          await pdf.destroy()
+          return
+        }
+
+        setPdfDocument(pdf)
+        setPdfRenderStatus('PDF layout preserved')
+      } catch {
+        if (!cancelled) {
+          setPdfDocument(null)
+          setPdfRenderStatus('Could not render the saved PDF view')
+        }
+      }
+    }
+
+    void loadPdfDocument()
+
+    return () => {
+      cancelled = true
+    }
+  }, [book.pdfDataUrl, book.sourceType])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -703,6 +1148,7 @@ function App() {
       setCurrentWordIndex(0)
       setIsSpeaking(false)
       setIsPaused(false)
+      setVisualPausePage(null)
       setStatus('Book imported')
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Import failed')
@@ -734,6 +1180,7 @@ function App() {
     window.speechSynthesis.cancel()
     setIsSpeaking(false)
     setIsPaused(false)
+    setVisualPausePage(null)
     setStatus('Stopped')
   }
 
@@ -785,6 +1232,7 @@ function App() {
     handleStop()
     setBook(DEFAULT_BOOK)
     setCurrentWordIndex(0)
+    setVisualPausePage(null)
     setStatus('Loaded welcome text')
   }
 
@@ -995,22 +1443,41 @@ function App() {
         </div>
 
         <div className="reader-layout">
-          <article ref={readerRef} className="reader-page" aria-label="Book text">
-            {tokens.map((token) =>
-              token.kind === 'space' ? (
-                <span key={`s-${token.tokenIndex}`}>{token.value}</span>
-              ) : (
-                <span
-                  key={`w-${token.wordIndex}`}
-                  ref={token.wordIndex === currentWordIndex ? activeWordRef : null}
-                  className={token.wordIndex === currentWordIndex ? 'word is-current' : 'word'}
-                  onClick={() => jumpToWord(token.wordIndex)}
-                >
-                  {token.value}
-                </span>
-              ),
-            )}
-          </article>
+          {isPdfVisualReader ? (
+            <article ref={readerRef} className="reader-page pdf-reader" aria-label="Rendered PDF">
+              {book.pdfPages?.map((pageInfo) => (
+                <PdfPageView
+                  key={pageInfo.pageNumber}
+                  activeRegions={activePdfRegions.filter(
+                    (region) => region.pageNumber === pageInfo.pageNumber,
+                  )}
+                  onJump={jumpToWord}
+                  pageInfo={pageInfo}
+                  pdfDocument={pdfDocument}
+                  registerActiveRegion={(node) => {
+                    activePdfRegionRef.current = node
+                  }}
+                />
+              ))}
+            </article>
+          ) : (
+            <article ref={readerRef} className="reader-page" aria-label="Book text">
+              {tokens.map((token) =>
+                token.kind === 'space' ? (
+                  <span key={`s-${token.tokenIndex}`}>{token.value}</span>
+                ) : (
+                  <span
+                    key={`w-${token.wordIndex}`}
+                    ref={token.wordIndex === currentWordIndex ? activeWordRef : null}
+                    className={token.wordIndex === currentWordIndex ? 'word is-current' : 'word'}
+                    onClick={() => jumpToWord(token.wordIndex)}
+                  >
+                    {token.value}
+                  </span>
+                ),
+              )}
+            </article>
+          )}
 
           <aside className="visual-panel" aria-label="Reading tracker">
             <div className="status-card">
@@ -1030,7 +1497,11 @@ function App() {
               <div>
                 <p className="status">{status}</p>
                 <h3>{currentWord || 'Ready'}</h3>
-                <p>{formatMinutes(minutesRemaining)} left at this speed</p>
+                <p>
+                  {book.sourceType === 'pdf' && pdfRenderStatus
+                    ? pdfRenderStatus
+                    : `${formatMinutes(minutesRemaining)} left at this speed`}
+                </p>
               </div>
             </div>
 
@@ -1051,7 +1522,11 @@ function App() {
               </div>
               <div>
                 <BookOpen aria-hidden="true" />
-                <span>{selectedVoice?.name ?? 'Default voice'}</span>
+                <span>
+                  {book.sourceType === 'pdf'
+                    ? `${book.pdfPages?.length ?? 0} pages, ${book.mathRegionCount ?? 0} math stops`
+                    : (selectedVoice?.name ?? 'Default voice')}
+                </span>
               </div>
             </div>
 

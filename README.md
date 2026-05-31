@@ -2,6 +2,8 @@
 
 A local-first book reader for uploaded `.txt`, `.epub`, and `.pdf` files with browser text-to-speech, speed and voice controls, word highlighting, reading progress, bookmarks, and focus mode.
 
+PDFs are rendered as pages instead of being flattened into plain text. The app keeps the original page structure visible, including images and equations, while TTS follows the text layer. Math-like text regions are highlighted and paused instead of being read aloud. Pages with embedded images get a visual pause before narration continues.
+
 ## Run
 
 ```sh
