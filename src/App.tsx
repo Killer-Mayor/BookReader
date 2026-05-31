@@ -160,10 +160,29 @@ const CHUNK_TARGET = 1800
 const CHUNK_LIMIT = 2800
 const PDF_CHUNK_WORD_LIMIT = 95
 const PDF_EQUATION_PAUSE_MS = 1100
+const PDF_IMPORT_YIELD_EVERY_PAGES = 3
+const DEBUG_PREFIX = '[AudioReader]'
 const MATH_TEXT_PATTERN =
   /([=<>≤≥≈≠∑∫√∞±×÷∂∆∇πµΩα-ωΑ-Ω^_{}|])|(\d+\s*[+\-*/=]\s*\d)|(\b[a-z]\s*[=<>]\s*)/i
 
 type PdfDocumentProxy = Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>
+type ImportProgress = (message: string) => void
+type PdfLoadingProgress = { loaded: number; total: number }
+
+function debugLog(event: string, details?: unknown) {
+  const elapsed = `${Math.round(performance.now())}ms`
+
+  if (details === undefined) {
+    console.info(DEBUG_PREFIX, elapsed, event)
+    return
+  }
+
+  console.info(DEBUG_PREFIX, elapsed, event, details)
+}
+
+function debugError(event: string, error: unknown) {
+  console.error(DEBUG_PREFIX, `${Math.round(performance.now())}ms`, event, error)
+}
 
 function safeParse<T>(value: string | null, fallback: T): T {
   if (!value) return fallback
@@ -184,22 +203,15 @@ function normalizeText(text: string) {
     .trim()
 }
 
-function arrayBufferToDataUrl(buffer: ArrayBuffer, mimeType: string) {
-  const bytes = new Uint8Array(buffer)
-  const chunkSize = 0x8000
-  let binary = ''
-
-  for (let cursor = 0; cursor < bytes.length; cursor += chunkSize) {
-    const chunk = bytes.subarray(cursor, cursor + chunkSize)
-    binary += String.fromCharCode(...chunk)
-  }
-
-  return `data:${mimeType};base64,${window.btoa(binary)}`
-}
-
 async function dataUrlToUint8Array(dataUrl: string) {
   const response = await fetch(dataUrl)
   return new Uint8Array(await response.arrayBuffer())
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0)
+  })
 }
 
 function titleFromFileName(fileName: string) {
@@ -343,38 +355,57 @@ function textFromHtml(html: string) {
 }
 
 async function extractTxt(file: File): Promise<ExtractedBook> {
+  debugLog('TXT import: reading file text', { name: file.name, size: file.size })
+  const text = normalizeText(await file.text())
+  debugLog('TXT import: complete', { characters: text.length })
+
   return {
     title: titleFromFileName(file.name),
     sourceType: 'txt',
-    text: normalizeText(await file.text()),
+    text,
   }
 }
 
-async function extractPdf(file: File): Promise<ExtractedBook> {
+async function extractPdf(file: File, onProgress?: ImportProgress): Promise<ExtractedBook> {
+  onProgress?.('Opening PDF')
+  debugLog('PDF import: start', {
+    name: file.name,
+    size: file.size,
+    type: file.type || 'unknown',
+  })
   const buffer = await file.arrayBuffer()
+  debugLog('PDF import: arrayBuffer loaded', { bytes: buffer.byteLength })
   const data = new Uint8Array(buffer.slice(0))
-  const pdf = await pdfjsLib.getDocument({ data }).promise
+  const loadingTask = pdfjsLib.getDocument({ data })
+
+  loadingTask.onProgress = (progress: PdfLoadingProgress) => {
+    debugLog('PDF import: PDF.js loading progress', {
+      loaded: progress.loaded,
+      total: progress.total,
+      percent: progress.total ? Math.round((progress.loaded / progress.total) * 100) : null,
+    })
+  }
+
+  const pdf = await loadingTask.promise
+  debugLog('PDF import: document opened', { pages: pdf.numPages })
   const pages: PdfPageInfo[] = []
   const regions: PdfTextRegion[] = []
   let text = ''
   let wordIndex = 0
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    onProgress?.(`Reading PDF page ${pageNumber} of ${pdf.numPages}`)
+    debugLog('PDF import: page start', { pageNumber, totalPages: pdf.numPages })
     const page = await pdf.getPage(pageNumber)
     const viewport = page.getViewport({ scale: 1 })
     const content = await page.getTextContent()
-    const operatorList = await page.getOperatorList()
-    const imageOps = new Set([
-      pdfjsLib.OPS.paintImageXObject,
-      pdfjsLib.OPS.paintInlineImageXObject,
-      pdfjsLib.OPS.paintXObject,
-    ])
+    const startingWordIndex = wordIndex
 
     pages.push({
       pageNumber,
       width: viewport.width,
       height: viewport.height,
-      hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
+      hasImages: false,
     })
 
     if (text) {
@@ -423,13 +454,29 @@ async function extractPdf(file: File): Promise<ExtractedBook> {
         text += '\n'
       }
     })
+
+    debugLog('PDF import: page complete', {
+      pageNumber,
+      textItems: content.items.length,
+      wordsAdded: wordIndex - startingWordIndex,
+      totalWords: wordIndex,
+    })
+
+    if (pageNumber % PDF_IMPORT_YIELD_EVERY_PAGES === 0) {
+      debugLog('PDF import: yielding to browser', { pageNumber })
+      await yieldToBrowser()
+    }
   }
 
   const normalizedText = normalizeText(text)
-
-  if (!normalizedText) {
-    throw new Error('No readable text was found in this PDF.')
-  }
+  const mathRegionCount = regions.filter((region) => region.isMath).length
+  debugLog('PDF import: extraction complete', {
+    pages: pages.length,
+    regions: regions.length,
+    mathRegionCount,
+    characters: normalizedText.length,
+    hasSelectableText: !!normalizedText,
+  })
 
   try {
     await pdf.destroy()
@@ -440,22 +487,26 @@ async function extractPdf(file: File): Promise<ExtractedBook> {
   return {
     title: titleFromFileName(file.name),
     sourceType: 'pdf',
-    text: normalizedText,
-    pdfDataUrl: arrayBufferToDataUrl(buffer, file.type || 'application/pdf'),
+    text:
+      normalizedText ||
+      'This PDF has no selectable text. The pages are preserved visually, but narration needs OCR.',
+    pdfDataUrl: URL.createObjectURL(new Blob([buffer], { type: file.type || 'application/pdf' })),
     pdfPages: pages,
     pdfRegions: regions,
-    mathRegionCount: regions.filter((region) => region.isMath).length,
+    mathRegionCount,
   }
 }
 
 function PdfPageView({
   activeRegions,
+  onImageDetected,
   onJump,
   pageInfo,
   pdfDocument,
   registerActiveRegion,
 }: {
   activeRegions: PdfTextRegion[]
+  onImageDetected: (pageNumber: number) => void
   onJump: (wordIndex: number) => void
   pageInfo: PdfPageInfo
   pdfDocument: PdfDocumentProxy
@@ -473,6 +524,7 @@ function PdfPageView({
       if (!canvas) return
 
       setIsRendered(false)
+      debugLog('PDF render: page start', { pageNumber: pageInfo.pageNumber })
       const page = await pdfDocument.getPage(pageInfo.pageNumber)
       const outputScale = Math.min(window.devicePixelRatio || 1, 2)
       const viewport = page.getViewport({ scale: outputScale })
@@ -485,17 +537,36 @@ function PdfPageView({
       canvas.style.aspectRatio = `${pageInfo.width} / ${pageInfo.height}`
       await page.render({ canvas, canvasContext: context, viewport }).promise
 
+      const imageOps = new Set([
+        pdfjsLib.OPS.paintImageXObject,
+        pdfjsLib.OPS.paintInlineImageXObject,
+        pdfjsLib.OPS.paintXObject,
+      ])
+      const operatorList = await page.getOperatorList()
+
       if (!cancelled) {
+        if (operatorList.fnArray.some((fn) => imageOps.has(fn))) {
+          onImageDetected(pageInfo.pageNumber)
+        }
+
         setIsRendered(true)
+        debugLog('PDF render: page complete', {
+          pageNumber: pageInfo.pageNumber,
+          canvasWidth: canvas.width,
+          canvasHeight: canvas.height,
+          hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
+        })
       }
     }
 
-    void renderPage()
+    void renderPage().catch((error: unknown) => {
+      debugError('PDF render: page failed', error)
+    })
 
     return () => {
       cancelled = true
     }
-  }, [pageInfo.height, pageInfo.pageNumber, pageInfo.width, pdfDocument])
+  }, [onImageDetected, pageInfo.height, pageInfo.pageNumber, pageInfo.width, pdfDocument])
 
   return (
     <section
@@ -539,6 +610,7 @@ function PdfPageView({
 }
 
 async function extractEpub(file: File): Promise<ExtractedBook> {
+  debugLog('EPUB import: start', { name: file.name, size: file.size, type: file.type || 'unknown' })
   const zip = await JSZip.loadAsync(await file.arrayBuffer())
   const containerXml = await zip.file('META-INF/container.xml')?.async('text')
 
@@ -600,6 +672,11 @@ async function extractEpub(file: File): Promise<ExtractedBook> {
     throw new Error('No readable chapters were found in this EPUB.')
   }
 
+  debugLog('EPUB import: complete', {
+    chapters: chapters.length,
+    characters: chapters.join('\n\n').length,
+  })
+
   return {
     title,
     sourceType: 'epub',
@@ -607,15 +684,21 @@ async function extractEpub(file: File): Promise<ExtractedBook> {
   }
 }
 
-async function extractBook(file: File): Promise<ExtractedBook> {
+async function extractBook(file: File, onProgress?: ImportProgress): Promise<ExtractedBook> {
   const sourceType = sourceTypeFromFile(file)
+  debugLog('Import: detected source type', {
+    name: file.name,
+    size: file.size,
+    type: file.type || 'unknown',
+    sourceType,
+  })
 
   if (!sourceType) {
     throw new Error('Please upload a .txt, .epub, or .pdf file.')
   }
 
   if (sourceType === 'txt') return extractTxt(file)
-  if (sourceType === 'pdf') return extractPdf(file)
+  if (sourceType === 'pdf') return extractPdf(file, onProgress)
 
   return extractEpub(file)
 }
@@ -653,6 +736,7 @@ function App() {
   const pausedImagePagesRef = useRef<Set<number>>(new Set())
   const resumeIndexRef = useRef(0)
   const isStoppingRef = useRef(false)
+  const importRunRef = useRef(0)
 
   const words = useMemo(() => splitWords(book.text), [book.text])
   const tokens = useMemo(() => buildTokens(book.text, words), [book.text, words])
@@ -661,6 +745,7 @@ function App() {
   const minutesRemaining = estimateMinutesRemaining(words.length, currentWordIndex, settings.rate)
   const selectedVoice = voices.find((voice) => voice.voiceURI === settings.voiceURI) ?? voices[0]
   const filteredBookmarks = bookmarks.filter((bookmark) => bookmark.id.startsWith(`${book.id}:`))
+  const pdfPageCount = book.pdfPages?.length ?? 0
   const pdfRegionsByWord = useMemo(
     () => new Map((book.pdfRegions ?? []).map((region) => [region.wordIndex, region])),
     [book.pdfRegions],
@@ -702,7 +787,7 @@ function App() {
 
     return regions
   }, [book.pdfPages, currentWordIndex, pdfRegionsByWord, visualPausePage, words.length])
-  const isPdfVisualReader = book.sourceType === 'pdf' && !!pdfDocument && !!book.pdfPages?.length
+  const isPdfVisualReader = book.sourceType === 'pdf' && !!pdfDocument && pdfPageCount > 0
   const searchMatchIndex = useMemo(() => {
     if (!query.trim()) return -1
 
@@ -759,6 +844,23 @@ function App() {
     },
     [isPdfMathWord, words],
   )
+
+  const markPdfPageHasImages = useCallback((pageNumber: number) => {
+    setBook((current) => {
+      if (current.sourceType !== 'pdf' || !current.pdfPages?.length) return current
+
+      const page = current.pdfPages.find((candidate) => candidate.pageNumber === pageNumber)
+
+      if (!page || page.hasImages) return current
+
+      return {
+        ...current,
+        pdfPages: current.pdfPages.map((candidate) =>
+          candidate.pageNumber === pageNumber ? { ...candidate, hasImages: true } : candidate,
+        ),
+      }
+    })
+  }, [])
 
   const jumpToWord = useCallback((wordIndex: number) => {
     const safeWordIndex = Math.max(0, Math.min(wordIndex, Math.max(words.length - 1, 0)))
@@ -999,8 +1101,15 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(book))
+      const persistedBook = { ...book }
+
+      if (persistedBook.pdfDataUrl?.startsWith('blob:')) {
+        delete persistedBook.pdfDataUrl
+      }
+
+      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(persistedBook))
     } catch {
+      debugError('Storage: failed to persist book', { id: book.id, sourceType: book.sourceType })
       if (!book.pdfDataUrl) return
 
       const bookWithoutPdfBytes = { ...book }
@@ -1068,8 +1177,22 @@ function App() {
 
       try {
         setPdfRenderStatus('Loading rendered PDF')
-        const pdf = await pdfjsLib.getDocument({ data: await dataUrlToUint8Array(book.pdfDataUrl) })
-          .promise
+        debugLog('PDF view: loading rendered document', {
+          title: book.title,
+          pages: pdfPageCount,
+          urlKind: book.pdfDataUrl.startsWith('blob:') ? 'blob' : 'data',
+        })
+        const loadingTask = pdfjsLib.getDocument({ data: await dataUrlToUint8Array(book.pdfDataUrl) })
+
+        loadingTask.onProgress = (progress: PdfLoadingProgress) => {
+          debugLog('PDF view: PDF.js loading progress', {
+            loaded: progress.loaded,
+            total: progress.total,
+            percent: progress.total ? Math.round((progress.loaded / progress.total) * 100) : null,
+          })
+        }
+
+        const pdf = await loadingTask.promise
 
         if (cancelled) {
           await pdf.destroy()
@@ -1078,7 +1201,9 @@ function App() {
 
         setPdfDocument(pdf)
         setPdfRenderStatus('PDF layout preserved')
-      } catch {
+        debugLog('PDF view: document ready', { pages: pdf.numPages })
+      } catch (error) {
+        debugError('PDF view: document failed to load', error)
         if (!cancelled) {
           setPdfDocument(null)
           setPdfRenderStatus('Could not render the saved PDF view')
@@ -1091,7 +1216,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [book.pdfDataUrl, book.sourceType])
+  }, [book.pdfDataUrl, book.sourceType, book.title, pdfPageCount])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1121,16 +1246,62 @@ function App() {
   }, [currentWordIndex, isPaused, isSpeaking, speakFromWord])
 
   useEffect(() => {
+    const handleWindowError = (event: ErrorEvent) => {
+      debugError('Window error', {
+        message: event.message,
+        filename: event.filename,
+        line: event.lineno,
+        column: event.colno,
+        error: event.error,
+      })
+    }
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      debugError('Unhandled promise rejection', event.reason)
+    }
+
+    window.addEventListener('error', handleWindowError)
+    window.addEventListener('unhandledrejection', handleUnhandledRejection)
+
+    debugLog('App mounted', {
+      userAgent: navigator.userAgent,
+      pdfWorker: pdfWorkerUrl,
+    })
+
     return () => {
       isStoppingRef.current = true
       window.speechSynthesis?.cancel()
+      window.removeEventListener('error', handleWindowError)
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection)
     }
   }, [])
 
   async function handleFile(file: File) {
+    const importRun = importRunRef.current + 1
+    importRunRef.current = importRun
+
     try {
+      debugLog('Upload: file selected', {
+        importRun,
+        name: file.name,
+        size: file.size,
+        type: file.type || 'unknown',
+        lastModified: file.lastModified,
+      })
       setStatus('Importing book')
-      const extracted = await extractBook(file)
+      setPdfRenderStatus('')
+      await yieldToBrowser()
+
+      const extracted = await extractBook(file, (message) => {
+        if (importRunRef.current === importRun) {
+          debugLog('Upload: progress', { importRun, message })
+          setStatus(message)
+        }
+      })
+
+      if (importRunRef.current !== importRun) {
+        debugLog('Upload: stale import ignored', { importRun, activeImport: importRunRef.current })
+        return
+      }
 
       if (!extracted.text) {
         throw new Error('No readable text was found in this file.')
@@ -1149,11 +1320,29 @@ function App() {
       setIsSpeaking(false)
       setIsPaused(false)
       setVisualPausePage(null)
-      setStatus('Book imported')
+      setStatus(
+        nextBook.sourceType === 'pdf' && nextBook.pdfRegions?.length === 0
+          ? 'PDF imported visually; no selectable text'
+          : 'Book imported',
+      )
+      debugLog('Upload: book committed to state', {
+        importRun,
+        id: nextBook.id,
+        sourceType: nextBook.sourceType,
+        characters: nextBook.text.length,
+        pages: nextBook.pdfPages?.length ?? null,
+        regions: nextBook.pdfRegions?.length ?? null,
+        mathRegionCount: nextBook.mathRegionCount ?? null,
+      })
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Import failed')
+      debugError('Upload: import failed', error)
+      if (importRunRef.current === importRun) {
+        setStatus(error instanceof Error ? error.message : 'Import failed')
+      }
     } finally {
-      setIsDraggingFile(false)
+      if (importRunRef.current === importRun) {
+        setIsDraggingFile(false)
+      }
     }
   }
 
@@ -1451,6 +1640,7 @@ function App() {
                   activeRegions={activePdfRegions.filter(
                     (region) => region.pageNumber === pageInfo.pageNumber,
                   )}
+                  onImageDetected={markPdfPageHasImages}
                   onJump={jumpToWord}
                   pageInfo={pageInfo}
                   pdfDocument={pdfDocument}
