@@ -58,9 +58,6 @@ export type SpeechBoundary = {
   wordIndex: number
 }
 
-type KokoroModule = typeof import('kokoro-js')
-type KokoroInstance = Awaited<ReturnType<KokoroModule['KokoroTTS']['from_pretrained']>>
-
 type TtsRequest = {
   text: string
   engine: TtsEngine
@@ -77,10 +74,22 @@ type TtsRequest = {
   onStatus: (message: string) => void
 }
 
+type TtsPreloadRequest = {
+  text: string
+  engine: TtsEngine
+  rate: number
+  kokoroVoiceId: KokoroVoiceId
+}
+
 type BrowserWindowWithAudio = Window & {
   AudioContext?: typeof AudioContext
   webkitAudioContext?: typeof AudioContext
 }
+
+type KokoroWorkerMessage =
+  | { id: number; type: 'status'; message: string }
+  | { id: number; type: 'audio'; audioBuffer: ArrayBuffer }
+  | { id: number; type: 'error'; message: string }
 
 const KOKORO_VOICE_IDS = new Set<string>(KOKORO_VOICES.map((voice) => voice.id))
 
@@ -90,17 +99,6 @@ export function isKokoroVoiceId(value: unknown): value is KokoroVoiceId {
 
 function isBrowserReady() {
   return typeof window !== 'undefined'
-}
-
-function statusFromProgress(progress: unknown) {
-  if (!progress || typeof progress !== 'object' || !('status' in progress)) return null
-
-  const status = String((progress as { status?: unknown }).status ?? '')
-
-  if (/download/i.test(status)) return 'Downloading local AI voice'
-  if (/ready|done/i.test(status)) return 'Loading local AI voice'
-
-  return null
 }
 
 export function useTts() {
@@ -117,7 +115,9 @@ export function useTts() {
   const audioRunRef = useRef(0)
   const boundaryFrameRef = useRef<number | null>(null)
   const playbackRunRef = useRef(0)
-  const kokoroRef = useRef<Promise<KokoroInstance> | null>(null)
+  const workerRef = useRef<Worker | null>(null)
+  const workerRequestRef = useRef(0)
+  const preloadedAudioRef = useRef<Map<string, Promise<ArrayBuffer>>>(new Map())
 
   const stopBoundaryClock = useCallback(() => {
     if (!isBrowserReady() || boundaryFrameRef.current === null) return
@@ -342,24 +342,96 @@ export function useTts() {
     window.speechSynthesis?.resume()
   }, [startWebAudio])
 
-  const getKokoro = useCallback((onStatus: TtsRequest['onStatus'], runId: number) => {
-    if (!kokoroRef.current) {
-      kokoroRef.current = import('kokoro-js').then(({ KokoroTTS }) =>
-        KokoroTTS.from_pretrained(KOKORO_MODEL_ID, {
-          dtype: 'q8',
-          device: 'wasm',
-          progress_callback: (progress: unknown) => {
-            if (playbackRunRef.current !== runId) return
-
-            const message = statusFromProgress(progress)
-            if (message) onStatus(message)
-          },
-        }),
-      )
+  const getWorker = useCallback(() => {
+    if (!workerRef.current) {
+      workerRef.current = new Worker(new URL('../workers/kokoroTtsWorker.ts', import.meta.url), {
+        type: 'module',
+      })
     }
 
-    return kokoroRef.current
+    return workerRef.current
   }, [])
+
+  const getKokoroCacheKey = useCallback(
+    (request: TtsPreloadRequest) =>
+      [request.kokoroVoiceId, request.rate.toFixed(3), request.text].join('\n'),
+    [],
+  )
+
+  const requestKokoroAudio = useCallback(
+    (
+      request: TtsPreloadRequest,
+      options: { runId?: number; onStatus?: (message: string) => void } = {},
+    ) =>
+      new Promise<ArrayBuffer>((resolve, reject) => {
+        const worker = getWorker()
+        const id = workerRequestRef.current + 1
+        workerRequestRef.current = id
+
+        const handleMessage = (event: MessageEvent<KokoroWorkerMessage>) => {
+          const message = event.data
+
+          if (message.id !== id) return
+
+          if (message.type === 'status') {
+            if (options.runId === undefined || playbackRunRef.current === options.runId) {
+              options.onStatus?.(message.message)
+            }
+            return
+          }
+
+          worker.removeEventListener('message', handleMessage)
+          worker.removeEventListener('error', handleError)
+
+          if (message.type === 'audio') {
+            resolve(message.audioBuffer)
+            return
+          }
+
+          reject(new Error(message.message))
+        }
+
+        const handleError = (event: ErrorEvent) => {
+          worker.removeEventListener('message', handleMessage)
+          worker.removeEventListener('error', handleError)
+          reject(event.error instanceof Error ? event.error : new Error(event.message))
+        }
+
+        worker.addEventListener('message', handleMessage)
+        worker.addEventListener('error', handleError, { once: true })
+        worker.postMessage({
+          id,
+          speed: request.rate,
+          text: request.text,
+          voice: request.kokoroVoiceId,
+        })
+      }),
+    [getWorker],
+  )
+
+  const preload = useCallback(
+    (request: TtsPreloadRequest) => {
+      if (!isBrowserReady() || request.engine !== 'kokoro' || !request.text.trim()) return
+
+      const cacheKey = getKokoroCacheKey(request)
+      const cache = preloadedAudioRef.current
+
+      if (cache.has(cacheKey)) return
+
+      const generation = requestKokoroAudio(request)
+      cache.set(cacheKey, generation)
+      void generation.catch((error) => {
+        cache.delete(cacheKey)
+        console.warn('[AudioReader] Local AI preload failed', error)
+      })
+
+      if (cache.size > 3) {
+        const oldestKey = cache.keys().next().value
+        if (oldestKey) cache.delete(oldestKey)
+      }
+    },
+    [getKokoroCacheKey, requestKokoroAudio],
+  )
 
   const speakWithBrowser = useCallback((request: TtsRequest, runId: number) => {
     if (!isBrowserReady() || !('speechSynthesis' in window)) {
@@ -418,14 +490,16 @@ export function useTts() {
       request.onStatus('Loading local AI voice')
 
       try {
-        const tts = await getKokoro(request.onStatus, runId)
-        if (playbackRunRef.current !== runId) return
-
-        request.onStatus('Generating audio')
-        const audio = await tts.generate(request.text, {
-          voice: request.kokoroVoiceId,
-          speed: request.rate,
-        })
+        const cacheKey = getKokoroCacheKey(request)
+        const cachedAudio = preloadedAudioRef.current.get(cacheKey)
+        const wavBuffer =
+          cachedAudio ??
+          requestKokoroAudio(request, {
+            runId,
+            onStatus: request.onStatus,
+          })
+        preloadedAudioRef.current.delete(cacheKey)
+        const resolvedWavBuffer = await wavBuffer
         if (playbackRunRef.current !== runId) return
 
         const audioContext = getAudioContext()
@@ -435,7 +509,7 @@ export function useTts() {
           return
         }
 
-        const audioBuffer = await audioContext.decodeAudioData(await audio.toBlob().arrayBuffer())
+        const audioBuffer = await audioContext.decodeAudioData(resolvedWavBuffer.slice(0))
         if (playbackRunRef.current !== runId) return
 
         if (audioContext.state === 'suspended') {
@@ -452,7 +526,14 @@ export function useTts() {
         speakWithBrowser(request, runId)
       }
     },
-    [getAudioContext, getKokoro, releaseAudio, speakWithBrowser, startWebAudio],
+    [
+      getAudioContext,
+      getKokoroCacheKey,
+      releaseAudio,
+      requestKokoroAudio,
+      speakWithBrowser,
+      startWebAudio,
+    ],
   )
 
   const speak = useCallback(
@@ -475,8 +556,17 @@ export function useTts() {
 
   useEffect(() => stop, [stop])
 
+  useEffect(
+    () => () => {
+      workerRef.current?.terminate()
+      workerRef.current = null
+    },
+    [],
+  )
+
   return {
     pause,
+    preload,
     resume,
     speak,
     stop,

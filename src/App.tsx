@@ -212,7 +212,10 @@ const VOICE_PROFILES: Record<
 
 const CHUNK_TARGET = 1800
 const CHUNK_LIMIT = 2800
+const KOKORO_CHUNK_TARGET = 420
+const KOKORO_CHUNK_LIMIT = 760
 const PDF_CHUNK_WORD_LIMIT = 95
+const KOKORO_PDF_CHUNK_WORD_LIMIT = 34
 const PDF_EQUATION_PAUSE_MS = 1100
 const PDF_IMPORT_YIELD_EVERY_PAGES = 3
 const MAX_PERSISTED_BOOK_CHARS = 250_000
@@ -491,28 +494,33 @@ function findWordIndexFromChar(words: WordSpan[], charIndex: number) {
   return Math.min(low, words.length - 1)
 }
 
-function getChunk(text: string, startChar: number) {
+function getChunk(
+  text: string,
+  startChar: number,
+  chunkTarget = CHUNK_TARGET,
+  chunkLimit = CHUNK_LIMIT,
+) {
   const remaining = text.slice(startChar)
 
-  if (remaining.length <= CHUNK_LIMIT) return remaining
+  if (remaining.length <= chunkLimit) return remaining
 
-  const targetSlice = remaining.slice(0, CHUNK_LIMIT)
-  const punctuationWindow = targetSlice.slice(CHUNK_TARGET)
+  const targetSlice = remaining.slice(0, chunkLimit)
+  const punctuationWindow = targetSlice.slice(chunkTarget)
   const punctuationMatch = punctuationWindow.search(/[.!?]\s+/)
 
   if (punctuationMatch >= 0) {
-    return targetSlice.slice(0, CHUNK_TARGET + punctuationMatch + 1)
+    return targetSlice.slice(0, chunkTarget + punctuationMatch + 1)
   }
 
   const paragraphBreak = targetSlice.lastIndexOf('\n\n')
 
-  if (paragraphBreak > CHUNK_TARGET * 0.55) {
+  if (paragraphBreak > chunkTarget * 0.55) {
     return targetSlice.slice(0, paragraphBreak)
   }
 
   const lastSpace = targetSlice.lastIndexOf(' ')
 
-  return targetSlice.slice(0, lastSpace > 0 ? lastSpace : CHUNK_LIMIT)
+  return targetSlice.slice(0, lastSpace > 0 ? lastSpace : chunkLimit)
 }
 
 function estimateMinutesRemaining(wordCount: number, currentWord: number, rate: number) {
@@ -1033,7 +1041,8 @@ function App() {
     isSupabaseConfigured ? 'Sign in to sync across devices' : 'Supabase env vars are not configured',
   )
   const [remoteBooks, setRemoteBooks] = useState<RemoteBook[]>([])
-  const { pause: pauseTts, resume: resumeTts, speak: speakTts, stop: stopTts } = useTts()
+  const { pause: pauseTts, preload: preloadTts, resume: resumeTts, speak: speakTts, stop: stopTts } =
+    useTts()
   const readerRef = useRef<HTMLDivElement | null>(null)
   const activeWordRef = useRef<HTMLSpanElement | null>(null)
   const activePdfRegionRef = useRef<HTMLButtonElement | null>(null)
@@ -1131,7 +1140,7 @@ function App() {
   )
 
   const buildPdfSpeechChunk = useCallback(
-    (startWordIndex: number) => {
+    (startWordIndex: number, wordLimit = PDF_CHUNK_WORD_LIMIT) => {
       const parts: string[] = []
       const boundaryMap: Array<{ charStart: number; wordIndex: number }> = []
       let charCursor = 0
@@ -1140,7 +1149,7 @@ function App() {
       while (
         cursor < words.length &&
         !isPdfMathWord(cursor) &&
-        parts.length < PDF_CHUNK_WORD_LIMIT
+        parts.length < wordLimit
       ) {
         const word = words[cursor].text
         const prefix = parts.length === 0 ? '' : ' '
@@ -1308,7 +1317,10 @@ function App() {
           return
         }
 
-        const chunk = buildPdfSpeechChunk(safeWordIndex)
+        const chunk = buildPdfSpeechChunk(
+          safeWordIndex,
+          settings.ttsEngine === 'kokoro' ? KOKORO_PDF_CHUNK_WORD_LIMIT : PDF_CHUNK_WORD_LIMIT,
+        )
 
         if (!chunk.text.trim()) {
           const nextWordIndex = findNextNarratablePdfWord(safeWordIndex + 1)
@@ -1361,11 +1373,28 @@ function App() {
           },
           onStatus: setStatus,
         })
+
+        if (settings.ttsEngine === 'kokoro' && chunk.nextWordIndex < words.length) {
+          const nextChunk = buildPdfSpeechChunk(chunk.nextWordIndex, KOKORO_PDF_CHUNK_WORD_LIMIT)
+
+          if (nextChunk.text.trim()) {
+            preloadTts({
+              text: nextChunk.text,
+              engine: 'kokoro',
+              rate: settings.rate,
+              kokoroVoiceId: settings.kokoroVoiceId,
+            })
+          }
+        }
+
         return
       }
 
       const startChar = words[safeWordIndex]?.start ?? 0
-      const chunk = getChunk(book.text, startChar)
+      const chunk =
+        settings.ttsEngine === 'kokoro'
+          ? getChunk(book.text, startChar, KOKORO_CHUNK_TARGET, KOKORO_CHUNK_LIMIT)
+          : getChunk(book.text, startChar)
 
       if (!chunk.trim()) {
         setIsSpeaking(false)
@@ -1416,6 +1445,30 @@ function App() {
         },
         onStatus: setStatus,
       })
+
+      if (settings.ttsEngine === 'kokoro') {
+        const nextChar = startChar + chunk.length
+        const nextWordIndex = findWordIndexFromChar(words, nextChar + 1)
+
+        if (nextWordIndex < words.length - 1 && nextChar < book.text.length - 1) {
+          const nextStartChar = words[nextWordIndex]?.start ?? nextChar
+          const nextChunk = getChunk(
+            book.text,
+            nextStartChar,
+            KOKORO_CHUNK_TARGET,
+            KOKORO_CHUNK_LIMIT,
+          )
+
+          if (nextChunk.trim()) {
+            preloadTts({
+              text: nextChunk,
+              engine: 'kokoro',
+              rate: settings.rate,
+              kokoroVoiceId: settings.kokoroVoiceId,
+            })
+          }
+        }
+      }
     },
     [
       book.pdfPages,
@@ -1427,6 +1480,7 @@ function App() {
       findNextNarratablePdfWord,
       isPdfMathWord,
       pdfRegionsByWord,
+      preloadTts,
       selectedVoice,
       settings.kokoroVoiceId,
       settings.pitch,
