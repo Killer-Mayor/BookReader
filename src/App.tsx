@@ -3,6 +3,7 @@ import {
   BookOpen,
   Bookmark,
   Check,
+  X,
   Eye,
   FileText,
   Gauge,
@@ -542,6 +543,8 @@ function PdfPageView({
 }) {
   const pageRef = useRef<HTMLElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const renderTaskRef = useRef<{ cancel: () => void; promise: Promise<unknown> } | null>(null)
+  const renderInFlightRef = useRef(false)
   const shouldForceRender = activeRegions.length > 0
   const [isNearViewport, setIsNearViewport] = useState(false)
   const [isRendered, setIsRendered] = useState(false)
@@ -583,40 +586,52 @@ function PdfPageView({
       const canvas = canvasRef.current
 
       if (!canvas) return
+      if (renderInFlightRef.current) return
+
+      renderInFlightRef.current = true
 
       setIsRendered(false)
       debugLog('PDF render: page start', { pageNumber: pageInfo.pageNumber })
-      const page = await pdfDocument.getPage(pageInfo.pageNumber)
-      const outputScale = Math.min(window.devicePixelRatio || 1, 2)
-      const viewport = page.getViewport({ scale: outputScale })
-      const context = canvas.getContext('2d')
+      try {
+        const page = await pdfDocument.getPage(pageInfo.pageNumber)
+        const outputScale = Math.min(window.devicePixelRatio || 1, 2)
+        const viewport = page.getViewport({ scale: outputScale })
+        const context = canvas.getContext('2d')
 
-      if (!context || cancelled) return
+        if (!context || cancelled) return
 
-      canvas.width = viewport.width
-      canvas.height = viewport.height
-      canvas.style.aspectRatio = `${pageInfo.width} / ${pageInfo.height}`
-      await page.render({ canvas, canvasContext: context, viewport }).promise
+        renderTaskRef.current?.cancel()
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+        canvas.style.aspectRatio = `${pageInfo.width} / ${pageInfo.height}`
 
-      const imageOps = new Set([
-        pdfjsLib.OPS.paintImageXObject,
-        pdfjsLib.OPS.paintInlineImageXObject,
-        pdfjsLib.OPS.paintXObject,
-      ])
-      const operatorList = await page.getOperatorList()
+        const renderTask = page.render({ canvas, canvasContext: context, viewport })
+        renderTaskRef.current = renderTask
+        await renderTask.promise
 
-      if (!cancelled) {
-        if (operatorList.fnArray.some((fn) => imageOps.has(fn))) {
-          onImageDetected(pageInfo.pageNumber)
+        const imageOps = new Set([
+          pdfjsLib.OPS.paintImageXObject,
+          pdfjsLib.OPS.paintInlineImageXObject,
+          pdfjsLib.OPS.paintXObject,
+        ])
+        const operatorList = await page.getOperatorList()
+
+        if (!cancelled) {
+          if (operatorList.fnArray.some((fn) => imageOps.has(fn))) {
+            onImageDetected(pageInfo.pageNumber)
+          }
+
+          setIsRendered(true)
+          debugLog('PDF render: page complete', {
+            pageNumber: pageInfo.pageNumber,
+            canvasWidth: canvas.width,
+            canvasHeight: canvas.height,
+            hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
+          })
         }
-
-        setIsRendered(true)
-        debugLog('PDF render: page complete', {
-          pageNumber: pageInfo.pageNumber,
-          canvasWidth: canvas.width,
-          canvasHeight: canvas.height,
-          hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
-        })
+      } finally {
+        renderTaskRef.current = null
+        renderInFlightRef.current = false
       }
     }
 
@@ -626,6 +641,7 @@ function PdfPageView({
 
     return () => {
       cancelled = true
+      renderTaskRef.current?.cancel()
     }
   }, [
     isNearViewport,
@@ -798,12 +814,14 @@ function App() {
   const [pdfDocument, setPdfDocument] = useState<PdfDocumentProxy | null>(null)
   const [pdfRenderStatus, setPdfRenderStatus] = useState('')
   const [visualPausePage, setVisualPausePage] = useState<number | null>(null)
+  const [focusControlsVisible, setFocusControlsVisible] = useState(true)
   const readerRef = useRef<HTMLDivElement | null>(null)
   const activeWordRef = useRef<HTMLSpanElement | null>(null)
   const activePdfRegionRef = useRef<HTMLButtonElement | null>(null)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const speakFromWordRef = useRef<(wordIndex: number) => void>(() => undefined)
   const pausedImagePagesRef = useRef<Set<number>>(new Set())
+  const focusHideTimerRef = useRef<number | null>(null)
   const resumeIndexRef = useRef(0)
   const isStoppingRef = useRef(false)
   const importRunRef = useRef(0)
@@ -860,14 +878,6 @@ function App() {
 
     return regions
   }, [book.pdfPages, currentWordIndex, pdfRegionsByWord, visualPausePage, words.length])
-  const activePdfPageNumber = activePdfRegions[0]?.pageNumber ?? pdfRegionsByWord.get(currentWordIndex)?.pageNumber ?? 1
-  const visiblePdfPages = useMemo(() => {
-    if (!book.pdfPages?.length) return []
-
-    return book.pdfPages.filter(
-      (pageInfo) => Math.abs(pageInfo.pageNumber - activePdfPageNumber) <= 1,
-    )
-  }, [activePdfPageNumber, book.pdfPages])
   const isPdfVisualReader = book.sourceType === 'pdf' && !!pdfDocument && pdfPageCount > 0
   const searchMatchIndex = useMemo(() => {
     if (!query.trim()) return -1
@@ -926,12 +936,6 @@ function App() {
     [isPdfMathWord, words],
   )
 
-  const firstWordOnPdfPage = useCallback(
-    (pageNumber: number) =>
-      book.pdfRegions?.find((region) => region.pageNumber === pageNumber)?.wordIndex ?? 0,
-    [book.pdfRegions],
-  )
-
   const markPdfPageHasImages = useCallback((pageNumber: number) => {
     setBook((current) => {
       if (current.sourceType !== 'pdf' || !current.pdfPages?.length) return current
@@ -948,6 +952,20 @@ function App() {
       }
     })
   }, [])
+
+  const revealFocusControls = useCallback(() => {
+    if (!settings.focusMode) return
+
+    setFocusControlsVisible(true)
+
+    if (focusHideTimerRef.current) {
+      window.clearTimeout(focusHideTimerRef.current)
+    }
+
+    focusHideTimerRef.current = window.setTimeout(() => {
+      setFocusControlsVisible(false)
+    }, 3200)
+  }, [settings.focusMode])
 
   const jumpToWord = useCallback((wordIndex: number) => {
     const safeWordIndex = Math.max(0, Math.min(wordIndex, Math.max(words.length - 1, 0)))
@@ -1225,6 +1243,27 @@ function App() {
   }, [book.id])
 
   useEffect(() => {
+    if (!settings.focusMode) {
+      if (focusHideTimerRef.current) {
+        window.clearTimeout(focusHideTimerRef.current)
+        focusHideTimerRef.current = null
+      }
+
+      window.setTimeout(() => setFocusControlsVisible(true), 0)
+      return
+    }
+
+    window.setTimeout(revealFocusControls, 0)
+
+    return () => {
+      if (focusHideTimerRef.current) {
+        window.clearTimeout(focusHideTimerRef.current)
+        focusHideTimerRef.current = null
+      }
+    }
+  }, [revealFocusControls, settings.focusMode])
+
+  useEffect(() => {
     const updateVoices = () => {
       const availableVoices = window.speechSynthesis?.getVoices() ?? []
       setVoices(availableVoices)
@@ -1314,6 +1353,11 @@ function App() {
         return
       }
 
+      if (event.key === 'Escape' && settings.focusMode) {
+        event.preventDefault()
+        setSettings((current) => ({ ...current, focusMode: false }))
+      }
+
       if (event.code === 'Space') {
         event.preventDefault()
         if (isSpeaking && !isPaused) {
@@ -1333,7 +1377,7 @@ function App() {
     window.addEventListener('keydown', handleKeyDown)
 
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [currentWordIndex, isPaused, isSpeaking, speakFromWord])
+  }, [currentWordIndex, isPaused, isSpeaking, settings.focusMode, speakFromWord])
 
   useEffect(() => {
     const handleWindowError = (event: ErrorEvent) => {
@@ -1521,8 +1565,16 @@ function App() {
     jumpToWord(findWordIndexFromChar(words, searchMatchIndex))
   }
 
+  const appClassName = [
+    'app',
+    settings.focusMode ? 'app-focus' : '',
+    settings.focusMode && !focusControlsVisible ? 'focus-controls-hidden' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+
   return (
-    <main className={settings.focusMode ? 'app app-focus' : 'app'}>
+    <main className={appClassName} onPointerDown={revealFocusControls} onPointerMove={revealFocusControls}>
       <aside className="side-panel">
         <div className="brand-lockup">
           <Headphones aria-hidden="true" />
@@ -1724,28 +1776,7 @@ function App() {
         <div className="reader-layout">
           {isPdfVisualReader ? (
             <article ref={readerRef} className="reader-page pdf-reader" aria-label="Rendered PDF">
-              <div className="pdf-window-toolbar">
-                <button
-                  type="button"
-                  onClick={() => jumpToWord(firstWordOnPdfPage(Math.max(activePdfPageNumber - 1, 1)))}
-                  disabled={activePdfPageNumber <= 1}
-                >
-                  Previous page
-                </button>
-                <span>
-                  Page {activePdfPageNumber} of {pdfPageCount}
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    jumpToWord(firstWordOnPdfPage(Math.min(activePdfPageNumber + 1, pdfPageCount)))
-                  }
-                  disabled={activePdfPageNumber >= pdfPageCount}
-                >
-                  Next page
-                </button>
-              </div>
-              {visiblePdfPages.map((pageInfo) => (
+              {book.pdfPages?.map((pageInfo) => (
                 <PdfPageView
                   key={pageInfo.pageNumber}
                   activeRegions={activePdfRegions.filter(
@@ -1760,10 +1791,6 @@ function App() {
                   }}
                 />
               ))}
-              <div className="pdf-window-note">
-                Rendering pages {visiblePdfPages[0]?.pageNumber ?? activePdfPageNumber}-
-                {visiblePdfPages.at(-1)?.pageNumber ?? activePdfPageNumber} for speed.
-              </div>
             </article>
           ) : book.sourceType === 'pdf' ? (
             <article ref={readerRef} className="reader-page pdf-reader" aria-label="Loading PDF">
@@ -1874,6 +1901,41 @@ function App() {
           </aside>
         </div>
       </section>
+
+      {settings.focusMode ? (
+        <div className="focus-dock" onPointerDown={(event) => event.stopPropagation()}>
+          <button type="button" className="icon-button" onClick={() => handleSkip(-80)} title="Back">
+            <SkipBack aria-hidden="true" />
+          </button>
+          <button type="button" className="play-button" onClick={handlePlayPause}>
+            {isSpeaking && !isPaused ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
+            <span>{isSpeaking && !isPaused ? 'Pause' : 'Play'}</span>
+          </button>
+          <button type="button" className="icon-button" onClick={() => handleSkip(80)} title="Forward">
+            <SkipForward aria-hidden="true" />
+          </button>
+          <button type="button" className="icon-button" onClick={handleStop} title="Stop">
+            <Square aria-hidden="true" />
+          </button>
+          <label>
+            <span>{settings.rate.toFixed(2)}x</span>
+            <input
+              type="range"
+              min="0.6"
+              max="1.8"
+              step="0.05"
+              value={settings.rate}
+              onChange={(event) =>
+                setSettings((current) => ({
+                  ...current,
+                  rate: Number(event.target.value),
+                  profile: 'balanced',
+                }))
+              }
+            />
+          </label>
+        </div>
+      ) : null}
     </main>
   )
 }

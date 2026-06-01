@@ -351,52 +351,6 @@ input[type='range'] {
   white-space: normal;
 }
 
-.pdf-window-toolbar {
-  width: min(100%, 920px);
-  justify-self: center;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  padding: 10px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
-}
-
-.pdf-window-toolbar button {
-  min-height: 36px;
-  border-radius: 8px;
-  padding: 0 12px;
-  color: #fff;
-  background: #16384f;
-  cursor: pointer;
-  font-weight: 700;
-}
-
-.pdf-window-toolbar button:first-child {
-  justify-self: start;
-}
-
-.pdf-window-toolbar button:last-child {
-  justify-self: end;
-}
-
-.pdf-window-toolbar button:disabled {
-  cursor: not-allowed;
-  opacity: 0.46;
-}
-
-.pdf-window-toolbar span,
-.pdf-window-note {
-  color: #425154;
-  font-size: 0.85rem;
-  font-weight: 800;
-}
-
-.pdf-window-note {
-  justify-self: center;
-}
-
 .pdf-loading-state {
   width: min(100%, 560px);
   min-height: 340px;
@@ -706,17 +660,81 @@ input[type='range'] {
   white-space: nowrap;
 }
 
-.app-focus .side-panel,
-.app-focus .reader-header,
-.app-focus .visual-panel {
-  opacity: 0.28;
-  transition: opacity 180ms ease;
+.focus-dock {
+  position: fixed;
+  left: 50%;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  z-index: 40;
+  width: min(680px, calc(100vw - 24px));
+  display: grid;
+  grid-template-columns: 42px minmax(96px, 1fr) 42px 42px minmax(120px, 1.1fr);
+  gap: 9px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid rgba(216, 224, 222, 0.86);
+  border-radius: 8px;
+  background: rgba(250, 252, 250, 0.94);
+  box-shadow: 0 16px 38px rgba(15, 26, 31, 0.18);
+  transform: translateX(-50%);
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease;
 }
 
-.app-focus .side-panel:hover,
-.app-focus .reader-header:hover,
-.app-focus .visual-panel:hover {
-  opacity: 1;
+.focus-dock label {
+  display: grid;
+  gap: 3px;
+}
+
+.focus-dock label span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.app-focus {
+  grid-template-columns: 1fr;
+  background: #101615;
+}
+
+.app-focus .side-panel,
+.app-focus .reader-header,
+.app-focus .progress-rail,
+.app-focus .visual-panel {
+  display: none;
+}
+
+.app-focus .reader-shell {
+  width: 100%;
+  min-height: 100svh;
+  padding: 0;
+}
+
+.app-focus .reader-layout {
+  display: block;
+}
+
+.app-focus .reader-page {
+  height: 100svh;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.app-focus .pdf-reader {
+  padding: clamp(10px, 2vw, 22px) clamp(8px, 2vw, 20px) calc(92px + env(safe-area-inset-bottom));
+  background: #111817;
+}
+
+.app-focus .pdf-page {
+  width: min(100%, 980px);
+}
+
+.app-focus.focus-controls-hidden .focus-dock {
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 16px);
 }
 
 @media (max-width: 1120px) {
@@ -766,9 +784,65 @@ input[type='range'] {
     height: 58svh;
   }
 
-  .app-focus .side-panel,
-  .app-focus .reader-header,
-  .app-focus .visual-panel {
-    opacity: 1;
+  .app-focus .reader-page {
+    height: 100svh;
+  }
+
+  .focus-dock {
+    grid-template-columns: 38px minmax(82px, 1fr) 38px 38px;
+    width: calc(100vw - 16px);
+    padding: 8px;
+    gap: 7px;
+  }
+
+  .focus-dock label {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 560px) {
+  .side-panel {
+    padding: 14px;
+    gap: 12px;
+  }
+
+  .control-group {
+    padding: 12px;
+  }
+
+  .reader-shell {
+    padding: 14px 10px;
+  }
+
+  .reader-page {
+    height: 64svh;
+    padding: 18px;
+  }
+
+  .pdf-reader {
+    gap: 14px;
+    padding: 10px;
+  }
+
+  .pdf-page {
+    width: 100%;
+  }
+
+  .status-card {
+    grid-template-columns: 86px minmax(0, 1fr);
+    padding: 12px;
+  }
+
+  .meter {
+    width: 78px;
+    height: 78px;
+  }
+
+  .transport {
+    grid-template-columns: 36px minmax(0, 1fr) 36px 36px;
+  }
+
+  .brand-lockup h1 {
+    font-size: 1.15rem;
   }
 }
