@@ -77,6 +77,11 @@ type TtsRequest = {
   onStatus: (message: string) => void
 }
 
+type BrowserWindowWithAudio = Window & {
+  AudioContext?: typeof AudioContext
+  webkitAudioContext?: typeof AudioContext
+}
+
 const KOKORO_VOICE_IDS = new Set<string>(KOKORO_VOICES.map((voice) => voice.id))
 
 export function isKokoroVoiceId(value: unknown): value is KokoroVoiceId {
@@ -101,6 +106,15 @@ function statusFromProgress(progress: unknown) {
 export function useTts() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioUrlRef = useRef<string | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const audioGainRef = useRef<GainNode | null>(null)
+  const audioBufferRef = useRef<AudioBuffer | null>(null)
+  const audioRequestRef = useRef<TtsRequest | null>(null)
+  const audioStartedAtRef = useRef(0)
+  const audioPausedAtRef = useRef(0)
+  const audioPauseInProgressRef = useRef(false)
+  const audioRunRef = useRef(0)
   const boundaryFrameRef = useRef<number | null>(null)
   const playbackRunRef = useRef(0)
   const kokoroRef = useRef<Promise<KokoroInstance> | null>(null)
@@ -112,7 +126,55 @@ export function useTts() {
     boundaryFrameRef.current = null
   }, [])
 
+  const getAudioContext = useCallback(() => {
+    if (!isBrowserReady()) return null
+
+    if (!audioContextRef.current) {
+      const audioWindow = window as BrowserWindowWithAudio
+      const AudioContextConstructor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext
+
+      if (!AudioContextConstructor) return null
+
+      audioContextRef.current = new AudioContextConstructor()
+    }
+
+    if (audioContextRef.current.state === 'suspended') {
+      void audioContextRef.current.resume()
+    }
+
+    return audioContextRef.current
+  }, [])
+
+  const stopWebAudio = useCallback((clearBuffer = true) => {
+    audioPauseInProgressRef.current = false
+
+    if (audioSourceRef.current) {
+      audioSourceRef.current.onended = null
+
+      try {
+        audioSourceRef.current.stop()
+      } catch {
+        // A source can only be stopped once; ignore repeat stops during cleanup.
+      }
+
+      audioSourceRef.current.disconnect()
+      audioSourceRef.current = null
+    }
+
+    audioGainRef.current?.disconnect()
+    audioGainRef.current = null
+    audioStartedAtRef.current = 0
+
+    if (clearBuffer) {
+      audioBufferRef.current = null
+      audioRequestRef.current = null
+      audioPausedAtRef.current = 0
+      audioRunRef.current = 0
+    }
+  }, [])
+
   const releaseAudio = useCallback(() => {
+    stopWebAudio()
     audioRef.current?.pause()
     audioRef.current = null
 
@@ -120,7 +182,7 @@ export function useTts() {
       window.URL.revokeObjectURL(audioUrlRef.current)
       audioUrlRef.current = null
     }
-  }, [])
+  }, [stopWebAudio])
 
   const stop = useCallback(() => {
     playbackRunRef.current += 1
@@ -132,30 +194,14 @@ export function useTts() {
     }
   }, [releaseAudio, stopBoundaryClock])
 
-  const pause = useCallback(() => {
-    if (!isBrowserReady()) return
-
-    if (audioRef.current) {
-      audioRef.current.pause()
-      return
-    }
-
-    window.speechSynthesis?.pause()
-  }, [])
-
-  const resume = useCallback(() => {
-    if (!isBrowserReady()) return
-
-    if (audioRef.current) {
-      void audioRef.current.play()
-      return
-    }
-
-    window.speechSynthesis?.resume()
-  }, [])
-
   const startEstimatedBoundaries = useCallback(
-    (audio: HTMLAudioElement, boundaryMap: SpeechBoundary[], runId: number, onBoundary: TtsRequest['onBoundary']) => {
+    (
+      getCurrentTime: () => number,
+      getDuration: () => number,
+      boundaryMap: SpeechBoundary[],
+      runId: number,
+      onBoundary: TtsRequest['onBoundary'],
+    ) => {
       stopBoundaryClock()
 
       if (boundaryMap.length === 0) return
@@ -163,12 +209,12 @@ export function useTts() {
       let lastWordIndex = -1
 
       const tick = () => {
-        if (playbackRunRef.current !== runId || audioRef.current !== audio) return
+        if (playbackRunRef.current !== runId) return
 
-        const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0
+        const duration = getDuration()
 
         if (duration > 0) {
-          const progress = Math.max(0, Math.min(audio.currentTime / duration, 0.999))
+          const progress = Math.max(0, Math.min(getCurrentTime() / duration, 0.999))
           const boundaryIndex = Math.min(
             boundaryMap.length - 1,
             Math.floor(progress * boundaryMap.length),
@@ -188,6 +234,113 @@ export function useTts() {
     },
     [stopBoundaryClock],
   )
+
+  const startWebAudio = useCallback(
+    (buffer: AudioBuffer, offset: number, request: TtsRequest, runId: number) => {
+      const context = getAudioContext()
+
+      if (!context) {
+        request.onError()
+        return
+      }
+
+      stopWebAudio(false)
+      audioBufferRef.current = buffer
+      audioRequestRef.current = request
+      audioRunRef.current = runId
+      audioPausedAtRef.current = offset
+      audioPauseInProgressRef.current = false
+
+      const source = context.createBufferSource()
+      const gain = context.createGain()
+      const safeOffset = Math.max(0, Math.min(offset, Math.max(buffer.duration - 0.01, 0)))
+
+      source.buffer = buffer
+      gain.gain.value = request.volume
+      source.connect(gain).connect(context.destination)
+
+      audioSourceRef.current = source
+      audioGainRef.current = gain
+      audioStartedAtRef.current = context.currentTime - safeOffset
+
+      source.onended = () => {
+        if (audioPauseInProgressRef.current) {
+          audioPauseInProgressRef.current = false
+          return
+        }
+
+        if (playbackRunRef.current !== runId) return
+
+        stopBoundaryClock()
+        stopWebAudio()
+        request.onEnd()
+      }
+
+      request.onStatus('Reading')
+      source.start(0, safeOffset)
+      startEstimatedBoundaries(
+        () => Math.max(0, context.currentTime - audioStartedAtRef.current),
+        () => buffer.duration,
+        request.boundaryMap,
+        runId,
+        request.onBoundary,
+      )
+    },
+    [getAudioContext, startEstimatedBoundaries, stopBoundaryClock, stopWebAudio],
+  )
+
+  const pause = useCallback(() => {
+    if (!isBrowserReady()) return
+
+    if (audioSourceRef.current && audioBufferRef.current) {
+      const context = audioContextRef.current
+      audioPausedAtRef.current = context
+        ? Math.min(audioBufferRef.current.duration, context.currentTime - audioStartedAtRef.current)
+        : audioPausedAtRef.current
+      audioPauseInProgressRef.current = true
+      stopBoundaryClock()
+
+      try {
+        audioSourceRef.current.stop()
+      } catch {
+        // A source can only be stopped once; ignore repeat pauses.
+      }
+
+      audioSourceRef.current.disconnect()
+      audioSourceRef.current = null
+      audioGainRef.current?.disconnect()
+      audioGainRef.current = null
+      return
+    }
+
+    if (audioRef.current) {
+      audioRef.current.pause()
+      return
+    }
+
+    window.speechSynthesis?.pause()
+  }, [stopBoundaryClock])
+
+  const resume = useCallback(() => {
+    if (!isBrowserReady()) return
+
+    if (audioBufferRef.current && audioRequestRef.current && !audioSourceRef.current) {
+      startWebAudio(
+        audioBufferRef.current,
+        audioPausedAtRef.current,
+        audioRequestRef.current,
+        audioRunRef.current,
+      )
+      return
+    }
+
+    if (audioRef.current) {
+      void audioRef.current.play()
+      return
+    }
+
+    window.speechSynthesis?.resume()
+  }, [startWebAudio])
 
   const getKokoro = useCallback((onStatus: TtsRequest['onStatus'], runId: number) => {
     if (!kokoroRef.current) {
@@ -275,37 +428,21 @@ export function useTts() {
         })
         if (playbackRunRef.current !== runId) return
 
-        const audioUrl = window.URL.createObjectURL(audio.toBlob())
-        const player = new Audio(audioUrl)
-        player.volume = request.volume
+        const audioContext = getAudioContext()
 
-        audioRef.current = player
-        audioUrlRef.current = audioUrl
-
-        player.onloadedmetadata = () => {
-          if (playbackRunRef.current !== runId) return
-          startEstimatedBoundaries(player, request.boundaryMap, runId, request.onBoundary)
-        }
-
-        player.onended = () => {
-          if (playbackRunRef.current !== runId) return
-
-          stopBoundaryClock()
-          releaseAudio()
-          request.onEnd()
-        }
-
-        player.onerror = () => {
-          if (playbackRunRef.current !== runId) return
-
-          stopBoundaryClock()
-          releaseAudio()
+        if (!audioContext) {
           request.onError()
+          return
         }
 
-        request.onStatus('Reading')
-        await player.play()
-        startEstimatedBoundaries(player, request.boundaryMap, runId, request.onBoundary)
+        const audioBuffer = await audioContext.decodeAudioData(await audio.toBlob().arrayBuffer())
+        if (playbackRunRef.current !== runId) return
+
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume()
+        }
+
+        startWebAudio(audioBuffer, 0, request, runId)
       } catch (error) {
         console.error('[AudioReader] Local AI voice failed', error)
 
@@ -315,7 +452,7 @@ export function useTts() {
         speakWithBrowser(request, runId)
       }
     },
-    [getKokoro, releaseAudio, speakWithBrowser, startEstimatedBoundaries, stopBoundaryClock],
+    [getAudioContext, getKokoro, releaseAudio, speakWithBrowser, startWebAudio],
   )
 
   const speak = useCallback(
@@ -326,13 +463,14 @@ export function useTts() {
       stopBoundaryClock()
 
       if (request.engine === 'kokoro') {
+        getAudioContext()
         void speakWithKokoro(request, runId)
         return
       }
 
       speakWithBrowser(request, runId)
     },
-    [speakWithBrowser, speakWithKokoro, stopBoundaryClock],
+    [getAudioContext, speakWithBrowser, speakWithKokoro, stopBoundaryClock],
   )
 
   useEffect(() => stop, [stop])
