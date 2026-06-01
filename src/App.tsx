@@ -25,7 +25,8 @@ import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
 import './App.css'
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  pdfWorkerUrl || `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`
 
 type SourceType = 'txt' | 'epub' | 'pdf'
 
@@ -547,7 +548,6 @@ function PdfPageView({
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const renderTaskRef = useRef<{ cancel: () => void; promise: Promise<unknown> } | null>(null)
   const renderInFlightRef = useRef(false)
-  const renderRetryRef = useRef(false)
   const shouldForceRender = activeRegions.length > 0 || forceInitialRender
   const [isNearViewport, setIsNearViewport] = useState(forceInitialRender)
   const [isRendered, setIsRendered] = useState(false)
@@ -591,14 +591,14 @@ function PdfPageView({
     }
 
     async function renderPage() {
+      while (renderInFlightRef.current) {
+        await yieldToBrowser()
+        if (cancelled) return
+      }
+
       const canvas = canvasRef.current
 
-      if (!canvas) return
-      if (renderInFlightRef.current) {
-        renderRetryRef.current = true
-        debugLog('PDF render: skipped duplicate request', { pageNumber: pageInfo.pageNumber })
-        return
-      }
+      if (!canvas || cancelled) return
 
       renderInFlightRef.current = true
 
@@ -606,6 +606,8 @@ function PdfPageView({
       debugLog('PDF render: page start', { pageNumber: pageInfo.pageNumber })
       try {
         const page = await pdfDocument.getPage(pageInfo.pageNumber)
+        if (cancelled) return
+
         const outputScale = Math.min(window.devicePixelRatio || 1, 2)
         const viewport = page.getViewport({ scale: outputScale })
         const context = canvas.getContext('2d')
@@ -620,26 +622,31 @@ function PdfPageView({
         renderTaskRef.current = renderTask
         await renderTask.promise
 
-        const imageOps = new Set([
-          pdfjsLib.OPS.paintImageXObject,
-          pdfjsLib.OPS.paintInlineImageXObject,
-          pdfjsLib.OPS.paintXObject,
-        ])
-        const operatorList = await page.getOperatorList()
-
         if (!cancelled) {
-          if (operatorList.fnArray.some((fn) => imageOps.has(fn))) {
-            onImageDetected(pageInfo.pageNumber)
-          }
-
           setIsRendered(true)
           debugLog('PDF render: page complete', {
             pageNumber: pageInfo.pageNumber,
             canvasWidth: canvas.width,
             canvasHeight: canvas.height,
-            hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
           })
         }
+
+        // Run image detection asynchronously in the background so it does not block rendering visibility
+        void page.getOperatorList().then((operatorList) => {
+          if (cancelled) return
+
+          const imageOps = new Set([
+            pdfjsLib.OPS.paintImageXObject,
+            pdfjsLib.OPS.paintInlineImageXObject,
+            pdfjsLib.OPS.paintXObject,
+          ])
+
+          if (operatorList.fnArray.some((fn) => imageOps.has(fn))) {
+            onImageDetected(pageInfo.pageNumber)
+          }
+        }).catch((err) => {
+          debugError('PDF render: background image detection failed', err)
+        })
       } catch (error) {
         if (error instanceof Error && error.name === 'RenderingCancelledException') {
           debugLog('PDF render: page cancelled', { pageNumber: pageInfo.pageNumber })
@@ -650,15 +657,6 @@ function PdfPageView({
       } finally {
         renderTaskRef.current = null
         renderInFlightRef.current = false
-
-        if (renderRetryRef.current && !cancelled && (isNearViewport || shouldForceRender)) {
-          renderRetryRef.current = false
-          window.setTimeout(() => {
-            void renderPage().catch((error: unknown) => {
-              debugError('PDF render: page retry failed', error)
-            })
-          }, 0)
-        }
       }
     }
 
@@ -685,7 +683,7 @@ function PdfPageView({
     <section
       ref={pageRef}
       className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
-      style={{ aspectRatio: `${pageInfo.width} / ${pageInfo.height}` }}
+      style={{ paddingBottom: `${(pageInfo.height / pageInfo.width) * 100}%` }}
       aria-label={`PDF page ${pageInfo.pageNumber}`}
     >
       <canvas ref={canvasRef} aria-hidden="true" />

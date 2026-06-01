@@ -383,7 +383,8 @@ input[type='range'] {
 }
 
 .pdf-page {
-  width: min(100%, 920px);
+  width: 100%;
+  max-width: 920px;
   position: relative;
   justify-self: center;
   overflow: hidden;
@@ -393,6 +394,9 @@ input[type='range'] {
 }
 
 .pdf-page canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
   width: 100%;
   height: 100%;
   display: block;
