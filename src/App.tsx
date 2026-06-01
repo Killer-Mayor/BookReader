@@ -528,6 +528,7 @@ async function extractPdf(file: File, onProgress?: ImportProgress): Promise<Extr
 
 function PdfPageView({
   activeRegions,
+  forceInitialRender,
   onImageDetected,
   onJump,
   pageInfo,
@@ -535,6 +536,7 @@ function PdfPageView({
   registerActiveRegion,
 }: {
   activeRegions: PdfTextRegion[]
+  forceInitialRender: boolean
   onImageDetected: (pageNumber: number) => void
   onJump: (wordIndex: number) => void
   pageInfo: PdfPageInfo
@@ -545,20 +547,26 @@ function PdfPageView({
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const renderTaskRef = useRef<{ cancel: () => void; promise: Promise<unknown> } | null>(null)
   const renderInFlightRef = useRef(false)
-  const shouldForceRender = activeRegions.length > 0
-  const [isNearViewport, setIsNearViewport] = useState(false)
+  const renderRetryRef = useRef(false)
+  const shouldForceRender = activeRegions.length > 0 || forceInitialRender
+  const [isNearViewport, setIsNearViewport] = useState(forceInitialRender)
   const [isRendered, setIsRendered] = useState(false)
 
   useEffect(() => {
     const pageNode = pageRef.current
 
     if (!pageNode) return
+    const scrollRoot = pageNode.closest('.reader-page')
 
     const observer = new IntersectionObserver(
       ([entry]) => {
         setIsNearViewport(entry.isIntersecting)
       },
-      { root: null, rootMargin: '900px 0px', threshold: 0.01 },
+      {
+        root: scrollRoot instanceof Element ? scrollRoot : null,
+        rootMargin: '900px 0px',
+        threshold: 0.01,
+      },
     )
 
     observer.observe(pageNode)
@@ -586,7 +594,11 @@ function PdfPageView({
       const canvas = canvasRef.current
 
       if (!canvas) return
-      if (renderInFlightRef.current) return
+      if (renderInFlightRef.current) {
+        renderRetryRef.current = true
+        debugLog('PDF render: skipped duplicate request', { pageNumber: pageInfo.pageNumber })
+        return
+      }
 
       renderInFlightRef.current = true
 
@@ -600,7 +612,6 @@ function PdfPageView({
 
         if (!context || cancelled) return
 
-        renderTaskRef.current?.cancel()
         canvas.width = viewport.width
         canvas.height = viewport.height
         canvas.style.aspectRatio = `${pageInfo.width} / ${pageInfo.height}`
@@ -629,9 +640,25 @@ function PdfPageView({
             hasImages: operatorList.fnArray.some((fn) => imageOps.has(fn)),
           })
         }
+      } catch (error) {
+        if (error instanceof Error && error.name === 'RenderingCancelledException') {
+          debugLog('PDF render: page cancelled', { pageNumber: pageInfo.pageNumber })
+          return
+        }
+
+        throw error
       } finally {
         renderTaskRef.current = null
         renderInFlightRef.current = false
+
+        if (renderRetryRef.current && !cancelled && (isNearViewport || shouldForceRender)) {
+          renderRetryRef.current = false
+          window.setTimeout(() => {
+            void renderPage().catch((error: unknown) => {
+              debugError('PDF render: page retry failed', error)
+            })
+          }, 0)
+        }
       }
     }
 
@@ -650,6 +677,7 @@ function PdfPageView({
     pageInfo.pageNumber,
     pageInfo.width,
     pdfDocument,
+    forceInitialRender,
     shouldForceRender,
   ])
 
@@ -1782,6 +1810,7 @@ function App() {
                   activeRegions={activePdfRegions.filter(
                     (region) => region.pageNumber === pageInfo.pageNumber,
                   )}
+                  forceInitialRender={pageInfo.pageNumber <= 2}
                   onImageDetected={markPdfPageHasImages}
                   onJump={jumpToWord}
                   pageInfo={pageInfo}
@@ -1916,6 +1945,14 @@ function App() {
           </button>
           <button type="button" className="icon-button" onClick={handleStop} title="Stop">
             <Square aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => setSettings((current) => ({ ...current, focusMode: false }))}
+            title="Exit focus mode"
+          >
+            <X aria-hidden="true" />
           </button>
           <label>
             <span>{settings.rate.toFixed(2)}x</span>

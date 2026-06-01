@@ -667,7 +667,7 @@ input[type='range'] {
   z-index: 40;
   width: min(680px, calc(100vw - 24px));
   display: grid;
-  grid-template-columns: 42px minmax(96px, 1fr) 42px 42px minmax(120px, 1.1fr);
+  grid-template-columns: 42px minmax(96px, 1fr) 42px 42px 42px minmax(120px, 1.1fr);
   gap: 9px;
   align-items: center;
   padding: 10px;
@@ -789,7 +789,7 @@ input[type='range'] {
   }
 
   .focus-dock {
-    grid-template-columns: 38px minmax(82px, 1fr) 38px 38px;
+    grid-template-columns: 38px minmax(82px, 1fr) 38px 38px 38px;
     width: calc(100vw - 16px);
     padding: 8px;
     gap: 7px;
