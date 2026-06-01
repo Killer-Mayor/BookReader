@@ -1,8 +1,12 @@
 {
   "name": "audio-reader",
-  "private": true,
   "version": "0.0.0",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Killer-Mayor/BookReader.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

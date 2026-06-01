@@ -19,6 +19,9 @@ import {
   Square,
   Upload,
   Volume2,
+  ZoomIn,
+  ZoomOut,
+  Navigation,
 } from 'lucide-react'
 import JSZip from 'jszip'
 import * as pdfjsLib from 'pdfjs-dist'
@@ -841,6 +844,8 @@ function App() {
   const [pdfRenderStatus, setPdfRenderStatus] = useState('')
   const [visualPausePage, setVisualPausePage] = useState<number | null>(null)
   const [focusControlsVisible, setFocusControlsVisible] = useState(true)
+  const [pdfZoom, setPdfZoom] = useState(1)
+  const [pdfPageInput, setPdfPageInput] = useState('')
   const readerRef = useRef<HTMLDivElement | null>(null)
   const activeWordRef = useRef<HTMLSpanElement | null>(null)
   const activePdfRegionRef = useRef<HTMLButtonElement | null>(null)
@@ -1561,15 +1566,118 @@ function App() {
     }))
   }
 
+  function handlePdfDoubleClick(event: React.MouseEvent) {
+    const pageNode = (event.target as Element).closest('.pdf-page') as HTMLElement
+    if (!pageNode) return
+    const pageMatch = pageNode.getAttribute('aria-label')?.match(/\d+/)
+    if (!pageMatch) return
+    const pageNumber = Number(pageMatch[0])
+    const rect = pageNode.getBoundingClientRect()
+    const relativeX = event.clientX - rect.left
+    const relativeY = event.clientY - rect.top
+
+    const pageInfo = book.pdfPages?.find((p) => p.pageNumber === pageNumber)
+    if (!pageInfo) return
+
+    const pdfX = (relativeX / rect.width) * pageInfo.width
+    const pdfY = (relativeY / rect.height) * pageInfo.height
+
+    let closestRegion = null
+    let minDistance = Infinity
+
+    const pageRegions = book.pdfRegions?.filter((r) => r.pageNumber === pageNumber) || []
+    for (const region of pageRegions) {
+      const regionCenterX = region.left + region.width / 2
+      const regionCenterY = region.top + region.height / 2
+      const distance = Math.hypot(regionCenterX - pdfX, regionCenterY - pdfY)
+      if (distance < minDistance) {
+        minDistance = distance
+        closestRegion = region
+      }
+    }
+
+    if (closestRegion) {
+      jumpToWord(closestRegion.wordIndex)
+      if (!isSpeaking || isPaused) {
+        handlePlayPause()
+      }
+    }
+  }
+
+  function getVisibleWordIndex() {
+    if (isPdfVisualReader) {
+      const pages = Array.from(document.querySelectorAll('.pdf-page'))
+      let bestPageNumber = 1
+      let minDistance = Infinity
+
+      for (const page of pages) {
+        const rect = page.getBoundingClientRect()
+        const centerY = window.innerHeight / 2
+        const pageCenter = rect.top + rect.height / 2
+        const distance = Math.abs(pageCenter - centerY)
+
+        if (distance < minDistance) {
+          minDistance = distance
+          const label = page.getAttribute('aria-label')
+          const numMatch = label?.match(/\d+/)
+          if (numMatch) {
+            bestPageNumber = Number(numMatch[0])
+          }
+        }
+      }
+
+      const region = book.pdfRegions?.find((r) => r.pageNumber === bestPageNumber)
+      return region ? region.wordIndex : currentWordIndex
+    } else {
+      const wordNodes = Array.from(document.querySelectorAll('.word'))
+      let bestIndex = currentWordIndex
+      let minDistance = Infinity
+
+      for (const word of wordNodes) {
+        const rect = word.getBoundingClientRect()
+        const distance = Math.abs(rect.top - window.innerHeight / 2)
+
+        if (distance < minDistance) {
+          minDistance = distance
+          const indexAttr = word.getAttribute('data-word-index')
+          if (indexAttr) {
+            bestIndex = Number(indexAttr)
+          }
+        }
+      }
+
+      return bestIndex
+    }
+  }
+
+  function playFromCurrentView() {
+    const targetWordIndex = getVisibleWordIndex()
+    jumpToWord(targetWordIndex)
+    if (!isSpeaking || isPaused) {
+      handlePlayPause()
+    }
+  }
+
+  function handleJumpToPage() {
+    const targetPage = Number(pdfPageInput)
+    if (!targetPage || isNaN(targetPage)) return
+    const region = book.pdfRegions?.find((r) => r.pageNumber === targetPage)
+    if (region) {
+      jumpToWord(region.wordIndex)
+      setPdfPageInput('')
+    }
+  }
+
   function addBookmark() {
+    const targetWordIndex = getVisibleWordIndex()
     const phrase = words
-      .slice(currentWordIndex, currentWordIndex + 7)
+      .slice(targetWordIndex, targetWordIndex + 7)
       .map((word) => word.text)
       .join(' ')
     const bookmark: BookmarkEntry = {
       id: `${book.id}:${Date.now()}`,
-      label: phrase || `Word ${currentWordIndex + 1}`,
-      wordIndex: currentWordIndex,
+      label: phrase || `Word ${targetWordIndex + 1}`,
+      wordIndex: targetWordIndex,
       createdAt: Date.now(),
     }
 
@@ -1755,6 +1863,10 @@ function App() {
             <Bookmark aria-hidden="true" />
             <span>Add bookmark</span>
           </button>
+          <button type="button" className="tool-button" onClick={playFromCurrentView}>
+            <Play aria-hidden="true" />
+            <span>Play from view</span>
+          </button>
           <button
             type="button"
             className={settings.focusMode ? 'tool-button is-active' : 'tool-button'}
@@ -1795,13 +1907,57 @@ function App() {
           </div>
         </header>
 
+        {book.sourceType === 'pdf' && (
+          <div className="pdf-toolbar">
+            <button
+              type="button"
+              onClick={() => setPdfZoom((z) => Math.max(0.5, z - 0.25))}
+              title="Zoom out"
+            >
+              <ZoomOut aria-hidden="true" />
+              <span>Zoom out</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setPdfZoom((z) => Math.min(2.5, z + 0.25))}
+              title="Zoom in"
+            >
+              <ZoomIn aria-hidden="true" />
+              <span>Zoom in</span>
+            </button>
+            <span>{Math.round(pdfZoom * 100)}%</span>
+
+            <div className="page-input">
+              <Navigation aria-hidden="true" style={{ width: 14, height: 14 }} />
+              <input
+                type="number"
+                placeholder="Page"
+                min={1}
+                max={pdfPageCount}
+                value={pdfPageInput}
+                onChange={(e) => setPdfPageInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleJumpToPage()
+                }}
+              />
+              <span className="page-count">of {pdfPageCount}</span>
+            </div>
+          </div>
+        )}
+
         <div className="progress-rail" aria-label={`Reading progress ${Math.round(progress)}%`}>
           <span style={{ width: `${progress}%` }} />
         </div>
 
         <div className="reader-layout">
           {isPdfVisualReader ? (
-            <article ref={readerRef} className="reader-page pdf-reader" aria-label="Rendered PDF">
+            <article 
+              ref={readerRef} 
+              className="reader-page pdf-reader" 
+              aria-label="Rendered PDF"
+              onDoubleClick={handlePdfDoubleClick}
+              style={{ '--pdf-zoom': pdfZoom } as React.CSSProperties}
+            >
               {book.pdfPages?.map((pageInfo) => (
                 <PdfPageView
                   key={pageInfo.pageNumber}
@@ -1840,6 +1996,7 @@ function App() {
                     key={`w-${token.wordIndex}`}
                     ref={token.wordIndex === currentWordIndex ? activeWordRef : null}
                     className={token.wordIndex === currentWordIndex ? 'word is-current' : 'word'}
+                    data-word-index={token.wordIndex}
                     onClick={() => jumpToWord(token.wordIndex)}
                   >
                     {token.value}

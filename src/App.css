@@ -384,7 +384,7 @@ input[type='range'] {
 
 .pdf-page {
   width: 100%;
-  max-width: 920px;
+  max-width: calc(920px * var(--pdf-zoom, 1));
   position: relative;
   justify-self: center;
   overflow: hidden;
