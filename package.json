@@ -8,14 +8,17 @@
     "url": "https://github.com/Killer-Mayor/BookReader.git"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "next dev",
+    "build": "next build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "start": "next start"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
     "jszip": "^3.10.1",
+    "kokoro-js": "^1.2.1",
     "lucide-react": "^1.17.0",
+    "next": "^15.5.18",
     "pdfjs-dist": "^5.6.205",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
@@ -25,10 +28,8 @@
     "@types/node": "^24.12.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^4.7.0",
     "eslint": "^9.39.4",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",

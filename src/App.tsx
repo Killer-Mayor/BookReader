@@ -1,17 +1,24 @@
+'use client'
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties, FormEvent, MouseEvent as ReactMouseEvent } from 'react'
 import {
   BookOpen,
   Bookmark,
   Check,
+  Cloud,
   X,
   Eye,
   FileText,
   Gauge,
   Headphones,
+  LogOut,
+  Mail,
   Moon,
   Pause,
   Play,
   Plus,
+  RefreshCw,
   RotateCcw,
   Search,
   SkipBack,
@@ -22,14 +29,27 @@ import {
   ZoomIn,
   ZoomOut,
   Navigation,
+  Sun,
 } from 'lucide-react'
 import JSZip from 'jszip'
-import * as pdfjsLib from 'pdfjs-dist'
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
-import './App.css'
-
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  pdfWorkerUrl || `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`
+import {
+  bookStorageBucket,
+  getSupabaseClient,
+  isSupabaseConfigured,
+  type BackendUser,
+  type RemoteBook,
+  type RemoteBookmark,
+  type RemoteProgress,
+  type RemoteSettings,
+} from './lib/supabase'
+import {
+  KOKORO_VOICES,
+  isKokoroVoiceId,
+  useTts,
+  type KokoroVoiceId,
+  type SpeechBoundary,
+  type TtsEngine,
+} from './hooks/useTts'
 
 type SourceType = 'txt' | 'epub' | 'pdf'
 
@@ -57,8 +77,14 @@ type ReaderSettings = {
   pitch: number
   volume: number
   voiceURI: string
+  ttsEngine: TtsEngine
+  kokoroVoiceId: KokoroVoiceId
   profile: VoiceProfileId
   focusMode: boolean
+  theme: ReaderTheme
+  textScale: number
+  lineHeight: number
+  fontFamily: ReaderFont
 }
 
 type WordSpan = {
@@ -90,6 +116,10 @@ type Token =
   | { kind: 'space'; value: string; tokenIndex: number }
 
 type VoiceProfileId = 'balanced' | 'deepFocus' | 'bright' | 'night'
+type ReaderTheme = 'light' | 'sepia' | 'dark'
+type ReaderFont = 'serif' | 'sans'
+
+type PdfjsLib = typeof import('pdfjs-dist/legacy/build/pdf.mjs')
 
 type ExtractedBook = {
   title: string
@@ -101,6 +131,8 @@ type ExtractedBook = {
   mathRegionCount?: number
 }
 
+type CloudStatus = 'disabled' | 'signed-out' | 'syncing' | 'ready' | 'error'
+
 const STORAGE_KEYS = {
   book: 'aural-reader.book',
   settings: 'aural-reader.settings',
@@ -110,9 +142,9 @@ const STORAGE_KEYS = {
 
 const DEFAULT_TEXT = `Drop in a book and make the page speak with you.
 
-This local reader is set up for txt, epub, and pdf files. Choose a voice, tune the speed, place bookmarks, and use focus mode when you want the text to take over the room.
+This local reader is set up for txt, epub, and pdf files. Choose a local AI voice, tune the speed, place bookmarks, and use focus mode when you want the text to take over the room.
 
-Browser voices are the right first engine for a private prototype because they do not require accounts or API keys. For a later upgrade, cloud engines such as OpenAI, ElevenLabs, Google Cloud Text-to-Speech, Azure Speech, or Amazon Polly can be added behind the same controls when you want more natural narration or cloned/private voices.`
+Local AI voices run in your browser with a one-time model download. Browser voices are still available as a private fallback, and cloud engines such as OpenAI, ElevenLabs, Google Cloud Text-to-Speech, Azure Speech, or Amazon Polly can be added later behind the same controls.`
 
 const DEFAULT_BOOK: ReaderBook = {
   id: 'welcome',
@@ -127,8 +159,25 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   pitch: 1,
   volume: 0.9,
   voiceURI: '',
+  ttsEngine: 'kokoro',
+  kokoroVoiceId: 'af_heart',
   profile: 'balanced',
   focusMode: false,
+  theme: 'light',
+  textScale: 1,
+  lineHeight: 1.78,
+  fontFamily: 'serif',
+}
+
+const READER_THEMES: Record<ReaderTheme, string> = {
+  light: 'Light',
+  sepia: 'Warm',
+  dark: 'Dark',
+}
+
+const READER_FONTS: Record<ReaderFont, string> = {
+  serif: 'Serif',
+  sans: 'Sans',
 }
 
 const VOICE_PROFILES: Record<
@@ -168,12 +217,38 @@ const PDF_EQUATION_PAUSE_MS = 1100
 const PDF_IMPORT_YIELD_EVERY_PAGES = 3
 const MAX_PERSISTED_BOOK_CHARS = 250_000
 const DEBUG_PREFIX = '[AudioReader]'
+const PDFJS_VERSION = '5.6.205'
 const MATH_TEXT_PATTERN =
   /([=<>≤≥≈≠∑∫√∞±×÷∂∆∇πµΩα-ωΑ-Ω^_{}|])|(\d+\s*[+\-*/=]\s*\d)|(\b[a-z]\s*[=<>]\s*)/i
 
-type PdfDocumentProxy = Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>
+type PdfDocumentProxy = Awaited<ReturnType<PdfjsLib['getDocument']>['promise']>
 type ImportProgress = (message: string) => void
 type PdfLoadingProgress = { loaded: number; total: number }
+
+let pdfjsLibPromise: Promise<PdfjsLib> | null = null
+
+function getPdfModuleSrc() {
+  return `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/legacy/build/pdf.mjs`
+}
+
+function getPdfWorkerSrc() {
+  return `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/legacy/build/pdf.worker.min.mjs`
+}
+
+async function loadPdfjs() {
+  if (!pdfjsLibPromise) {
+    const importBrowserModule = new Function('url', 'return import(url)') as (
+      url: string,
+    ) => Promise<PdfjsLib>
+
+    pdfjsLibPromise = importBrowserModule(getPdfModuleSrc()).then((pdfjsLib) => {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = getPdfWorkerSrc()
+      return pdfjsLib
+    })
+  }
+
+  return pdfjsLibPromise
+}
 
 function debugLog(event: string, details?: unknown) {
   const elapsed = `${Math.round(performance.now())}ms`
@@ -198,6 +273,18 @@ function safeParse<T>(value: string | null, fallback: T): T {
   } catch {
     return fallback
   }
+}
+
+function readStorage<T>(key: string, fallback: T): T {
+  if (typeof window === 'undefined') return fallback
+
+  return safeParse<T>(window.localStorage.getItem(key), fallback)
+}
+
+function writeStorage(key: string, value: unknown) {
+  if (typeof window === 'undefined') return
+
+  window.localStorage.setItem(key, JSON.stringify(value))
 }
 
 function normalizeText(text: string) {
@@ -259,6 +346,91 @@ function sourceTypeFromFile(file: File): SourceType | null {
   if (lowerName.endsWith('.pdf')) return 'pdf'
 
   return null
+}
+
+function mimeTypeForSource(sourceType: SourceType) {
+  if (sourceType === 'pdf') return 'application/pdf'
+  if (sourceType === 'epub') return 'application/epub+zip'
+
+  return 'text/plain'
+}
+
+function safeFileSegment(fileName: string) {
+  return fileName.replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'book'
+}
+
+function isRemoteBookId(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  )
+}
+
+function isVoiceProfileId(value: unknown): value is VoiceProfileId {
+  return typeof value === 'string' && value in VOICE_PROFILES
+}
+
+function isReaderTheme(value: unknown): value is ReaderTheme {
+  return typeof value === 'string' && value in READER_THEMES
+}
+
+function isReaderFont(value: unknown): value is ReaderFont {
+  return typeof value === 'string' && value in READER_FONTS
+}
+
+function isTtsEngine(value: unknown): value is TtsEngine {
+  return value === 'kokoro' || value === 'browser'
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  const numeric = Number(value)
+
+  if (!Number.isFinite(numeric)) return fallback
+
+  return Math.max(min, Math.min(numeric, max))
+}
+
+function normalizeReaderSettings(settings: Partial<ReaderSettings>): ReaderSettings {
+  return {
+    ...DEFAULT_SETTINGS,
+    ...settings,
+    rate: clampNumber(settings.rate, DEFAULT_SETTINGS.rate, 0.6, 1.8),
+    pitch: clampNumber(settings.pitch, DEFAULT_SETTINGS.pitch, 0.5, 1.6),
+    volume: clampNumber(settings.volume, DEFAULT_SETTINGS.volume, 0, 1),
+    voiceURI: typeof settings.voiceURI === 'string' ? settings.voiceURI : DEFAULT_SETTINGS.voiceURI,
+    ttsEngine: isTtsEngine(settings.ttsEngine) ? settings.ttsEngine : DEFAULT_SETTINGS.ttsEngine,
+    kokoroVoiceId: isKokoroVoiceId(settings.kokoroVoiceId)
+      ? settings.kokoroVoiceId
+      : DEFAULT_SETTINGS.kokoroVoiceId,
+    profile: isVoiceProfileId(settings.profile) ? settings.profile : DEFAULT_SETTINGS.profile,
+    focusMode:
+      typeof settings.focusMode === 'boolean' ? settings.focusMode : DEFAULT_SETTINGS.focusMode,
+    theme: isReaderTheme(settings.theme) ? settings.theme : DEFAULT_SETTINGS.theme,
+    textScale: clampNumber(settings.textScale, DEFAULT_SETTINGS.textScale, 0.85, 1.35),
+    lineHeight: clampNumber(settings.lineHeight, DEFAULT_SETTINGS.lineHeight, 1.45, 2.15),
+    fontFamily: isReaderFont(settings.fontFamily)
+      ? settings.fontFamily
+      : DEFAULT_SETTINGS.fontFamily,
+  }
+}
+
+function remoteBookmarkToLocal(bookmark: RemoteBookmark): BookmarkEntry {
+  return {
+    id: `${bookmark.book_id}:${bookmark.id}`,
+    label: bookmark.label,
+    wordIndex: bookmark.word_index,
+    createdAt: Date.parse(bookmark.created_at),
+  }
+}
+
+function remoteSettingsToLocal(settings: RemoteSettings): Partial<ReaderSettings> {
+  return {
+    rate: Number(settings.rate ?? DEFAULT_SETTINGS.rate),
+    pitch: Number(settings.pitch ?? DEFAULT_SETTINGS.pitch),
+    volume: Number(settings.volume ?? DEFAULT_SETTINGS.volume),
+    voiceURI: settings.voice_uri ?? '',
+    profile: isVoiceProfileId(settings.profile) ? settings.profile : DEFAULT_SETTINGS.profile,
+    focusMode: settings.focus_mode ?? DEFAULT_SETTINGS.focusMode,
+  }
 }
 
 function splitWords(text: string): WordSpan[] {
@@ -408,6 +580,7 @@ async function extractPdf(file: File, onProgress?: ImportProgress): Promise<Extr
   })
   const buffer = await file.arrayBuffer()
   debugLog('PDF import: arrayBuffer loaded', { bytes: buffer.byteLength })
+  const pdfjsLib = await loadPdfjs()
   const data = new Uint8Array(buffer.slice(0))
   const loadingTask = pdfjsLib.getDocument({ data })
 
@@ -534,7 +707,7 @@ function PdfPageView({
   activeRegions,
   forceInitialRender,
   onImageDetected,
-  onJump,
+  onStartFromWord,
   pageInfo,
   pdfDocument,
   registerActiveRegion,
@@ -542,7 +715,7 @@ function PdfPageView({
   activeRegions: PdfTextRegion[]
   forceInitialRender: boolean
   onImageDetected: (pageNumber: number) => void
-  onJump: (wordIndex: number) => void
+  onStartFromWord: (wordIndex: number) => void
   pageInfo: PdfPageInfo
   pdfDocument: PdfDocumentProxy
   registerActiveRegion: (node: HTMLButtonElement | null) => void
@@ -608,6 +781,7 @@ function PdfPageView({
       setIsRendered(false)
       debugLog('PDF render: page start', { pageNumber: pageInfo.pageNumber })
       try {
+        const pdfjsLib = await loadPdfjs()
         const page = await pdfDocument.getPage(pageInfo.pageNumber)
         if (cancelled) return
 
@@ -691,7 +865,7 @@ function PdfPageView({
     >
       <div 
         className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
-        style={{ paddingBottom: `${(pageInfo.height / pageInfo.width) * 100}%` }}
+        style={{ aspectRatio: `${pageInfo.width} / ${pageInfo.height}` }}
       >
         <canvas ref={canvasRef} aria-hidden="true" />
         <div className="pdf-page-number">Page {pageInfo.pageNumber}</div>
@@ -714,7 +888,7 @@ function PdfPageView({
               width: `${(region.width / pageInfo.width) * 100}%`,
               height: `${(region.height / pageInfo.height) * 100}%`,
             }}
-            onClick={() => onJump(region.wordIndex)}
+            onClick={() => onStartFromWord(region.wordIndex)}
             aria-label={
               region.isVisual
                 ? 'Visual page pause region'
@@ -825,18 +999,17 @@ async function extractBook(file: File, onProgress?: ImportProgress): Promise<Ext
 
 function App() {
   const [book, setBook] = useState<ReaderBook>(() =>
-    safeParse<ReaderBook>(localStorage.getItem(STORAGE_KEYS.book), DEFAULT_BOOK),
+    readStorage<ReaderBook>(STORAGE_KEYS.book, DEFAULT_BOOK),
   )
-  const [settings, setSettings] = useState<ReaderSettings>(() => ({
-    ...DEFAULT_SETTINGS,
-    ...safeParse<Partial<ReaderSettings>>(localStorage.getItem(STORAGE_KEYS.settings), {}),
-  }))
+  const [settings, setSettings] = useState<ReaderSettings>(() =>
+    normalizeReaderSettings(readStorage<Partial<ReaderSettings>>(STORAGE_KEYS.settings, {})),
+  )
   const [bookmarks, setBookmarks] = useState<BookmarkEntry[]>(() =>
-    safeParse<BookmarkEntry[]>(localStorage.getItem(STORAGE_KEYS.bookmarks), []),
+    readStorage<BookmarkEntry[]>(STORAGE_KEYS.bookmarks, []),
   )
   const [currentWordIndex, setCurrentWordIndex] = useState(() =>
-    safeParse<Record<string, number>>(localStorage.getItem(STORAGE_KEYS.progress), {})[
-      safeParse<ReaderBook>(localStorage.getItem(STORAGE_KEYS.book), DEFAULT_BOOK).id
+    readStorage<Record<string, number>>(STORAGE_KEYS.progress, {})[
+      readStorage<ReaderBook>(STORAGE_KEYS.book, DEFAULT_BOOK).id
     ] ?? 0,
   )
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([])
@@ -851,10 +1024,19 @@ function App() {
   const [focusControlsVisible, setFocusControlsVisible] = useState(true)
   const [pdfZoom, setPdfZoom] = useState(1)
   const [pdfPageInput, setPdfPageInput] = useState('')
+  const [cloudUser, setCloudUser] = useState<BackendUser | null>(null)
+  const [cloudEmail, setCloudEmail] = useState('')
+  const [cloudStatus, setCloudStatus] = useState<CloudStatus>(
+    isSupabaseConfigured ? 'signed-out' : 'disabled',
+  )
+  const [cloudMessage, setCloudMessage] = useState(
+    isSupabaseConfigured ? 'Sign in to sync across devices' : 'Supabase env vars are not configured',
+  )
+  const [remoteBooks, setRemoteBooks] = useState<RemoteBook[]>([])
+  const { pause: pauseTts, resume: resumeTts, speak: speakTts, stop: stopTts } = useTts()
   const readerRef = useRef<HTMLDivElement | null>(null)
   const activeWordRef = useRef<HTMLSpanElement | null>(null)
   const activePdfRegionRef = useRef<HTMLButtonElement | null>(null)
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const speakFromWordRef = useRef<(wordIndex: number) => void>(() => undefined)
   const pausedImagePagesRef = useRef<Set<number>>(new Set())
   const focusHideTimerRef = useRef<number | null>(null)
@@ -862,6 +1044,7 @@ function App() {
   const isStoppingRef = useRef(false)
   const importRunRef = useRef(0)
 
+  const supabase = useMemo(() => getSupabaseClient(), [])
   const words = useMemo(() => splitWords(book.text), [book.text])
   const tokens = useMemo(
     () => (book.sourceType === 'pdf' ? [] : buildTokens(book.text, words)),
@@ -871,6 +1054,16 @@ function App() {
   const currentWord = words[currentWordIndex]?.text ?? ''
   const minutesRemaining = estimateMinutesRemaining(words.length, currentWordIndex, settings.rate)
   const selectedVoice = voices.find((voice) => voice.voiceURI === settings.voiceURI) ?? voices[0]
+  const selectedKokoroVoice =
+    KOKORO_VOICES.find((voice) => voice.id === settings.kokoroVoiceId) ?? KOKORO_VOICES[0]
+  const selectedVoiceValue =
+    settings.ttsEngine === 'kokoro'
+      ? `kokoro:${settings.kokoroVoiceId}`
+      : `browser:${settings.voiceURI}`
+  const selectedVoiceLabel =
+    settings.ttsEngine === 'kokoro'
+      ? `${selectedKokoroVoice.label} (${selectedKokoroVoice.locale})`
+      : (selectedVoice?.name ?? 'Default voice')
   const filteredBookmarks = bookmarks.filter((bookmark) => bookmark.id.startsWith(`${book.id}:`))
   const pdfPageCount = book.pdfPages?.length ?? 0
   const pdfRegionsByWord = useMemo(
@@ -972,6 +1165,28 @@ function App() {
     [isPdfMathWord, words],
   )
 
+  const buildTextSpeechBoundaryMap = useCallback(
+    (startWordIndex: number, startChar: number, chunkLength: number): SpeechBoundary[] => {
+      const boundaryMap: SpeechBoundary[] = []
+      const chunkEnd = startChar + chunkLength
+
+      for (let cursor = startWordIndex; cursor < words.length; cursor += 1) {
+        const word = words[cursor]
+
+        if (!word || word.start >= chunkEnd) break
+        if (word.end <= startChar) continue
+
+        boundaryMap.push({
+          charStart: Math.max(0, word.start - startChar),
+          wordIndex: cursor,
+        })
+      }
+
+      return boundaryMap
+    },
+    [words],
+  )
+
   const markPdfPageHasImages = useCallback((pageNumber: number) => {
     setBook((current) => {
       if (current.sourceType !== 'pdf' || !current.pdfPages?.length) return current
@@ -1017,25 +1232,26 @@ function App() {
 
   const persistProgress = useCallback(
     (wordIndex: number) => {
-      const progressByBook = safeParse<Record<string, number>>(
-        localStorage.getItem(STORAGE_KEYS.progress),
-        {},
-      )
+      const progressByBook = readStorage<Record<string, number>>(STORAGE_KEYS.progress, {})
       progressByBook[book.id] = wordIndex
-      localStorage.setItem(STORAGE_KEYS.progress, JSON.stringify(progressByBook))
+      writeStorage(STORAGE_KEYS.progress, progressByBook)
     },
     [book.id],
   )
 
   const speakFromWord = useCallback(
     (wordIndex: number) => {
-      if (!('speechSynthesis' in window) || words.length === 0) {
+      if (typeof window === 'undefined' || words.length === 0) {
+        return
+      }
+
+      if (settings.ttsEngine === 'browser' && !('speechSynthesis' in window)) {
         setStatus('Speech synthesis is not available in this browser')
         return
       }
 
       isStoppingRef.current = false
-      window.speechSynthesis.cancel()
+      stopTts()
 
       const safeWordIndex = Math.max(0, Math.min(wordIndex, words.length - 1))
 
@@ -1107,56 +1323,44 @@ function App() {
           return
         }
 
-        const utterance = new SpeechSynthesisUtterance(chunk.text)
-        utterance.rate = settings.rate
-        utterance.pitch = settings.pitch
-        utterance.volume = settings.volume
-
-        if (selectedVoice) {
-          utterance.voice = selectedVoice
-          utterance.lang = selectedVoice.lang
-        }
-
-        utterance.onboundary = (event) => {
-          if (typeof event.charIndex !== 'number') return
-
-          const activeBoundary =
-            chunk.boundaryMap.findLast((boundary) => boundary.charStart <= event.charIndex) ??
-            chunk.boundaryMap[0]
-
-          if (!activeBoundary) return
-
-          resumeIndexRef.current = activeBoundary.wordIndex
-          setCurrentWordIndex(activeBoundary.wordIndex)
-        }
-
-        utterance.onend = () => {
-          if (isStoppingRef.current) return
-
-          if (chunk.nextWordIndex < words.length) {
-            speakFromWordRef.current(chunk.nextWordIndex)
-          } else {
-            setCurrentWordIndex(words.length - 1)
-            setIsSpeaking(false)
-            setIsPaused(false)
-            setStatus('Finished')
-          }
-        }
-
-        utterance.onerror = () => {
-          if (isStoppingRef.current) return
-          setIsSpeaking(false)
-          setIsPaused(false)
-          setStatus('Voice playback stopped')
-        }
-
-        utteranceRef.current = utterance
         resumeIndexRef.current = safeWordIndex
         setCurrentWordIndex(safeWordIndex)
         setIsSpeaking(true)
         setIsPaused(false)
-        setStatus('Reading PDF text')
-        window.speechSynthesis.speak(utterance)
+        speakTts({
+          text: chunk.text,
+          engine: settings.ttsEngine,
+          rate: settings.rate,
+          pitch: settings.pitch,
+          volume: settings.volume,
+          kokoroVoiceId: settings.kokoroVoiceId,
+          browserVoice: selectedVoice,
+          boundaryMap: chunk.boundaryMap,
+          browserStatus: 'Reading PDF text',
+          onBoundary: (activeWordIndex) => {
+            resumeIndexRef.current = activeWordIndex
+            setCurrentWordIndex(activeWordIndex)
+          },
+          onEnd: () => {
+            if (isStoppingRef.current) return
+
+            if (chunk.nextWordIndex < words.length) {
+              speakFromWordRef.current(chunk.nextWordIndex)
+            } else {
+              setCurrentWordIndex(words.length - 1)
+              setIsSpeaking(false)
+              setIsPaused(false)
+              setStatus('Finished')
+            }
+          },
+          onError: () => {
+            if (isStoppingRef.current) return
+            setIsSpeaking(false)
+            setIsPaused(false)
+            setStatus('Voice playback stopped')
+          },
+          onStatus: setStatus,
+        })
         return
       }
 
@@ -1169,55 +1373,49 @@ function App() {
         return
       }
 
-      const utterance = new SpeechSynthesisUtterance(chunk)
-      utterance.rate = settings.rate
-      utterance.pitch = settings.pitch
-      utterance.volume = settings.volume
+      const boundaryMap = buildTextSpeechBoundaryMap(safeWordIndex, startChar, chunk.length)
 
-      if (selectedVoice) {
-        utterance.voice = selectedVoice
-        utterance.lang = selectedVoice.lang
-      }
-
-      utterance.onboundary = (event) => {
-        if (typeof event.charIndex !== 'number') return
-
-        const globalCharIndex = startChar + event.charIndex
-        const nextWordIndex = findWordIndexFromChar(words, globalCharIndex)
-        resumeIndexRef.current = nextWordIndex
-        setCurrentWordIndex(nextWordIndex)
-      }
-
-      utterance.onend = () => {
-        if (isStoppingRef.current) return
-
-        const nextChar = startChar + chunk.length
-        const nextWordIndex = findWordIndexFromChar(words, nextChar + 1)
-
-        if (nextWordIndex < words.length - 1 && nextChar < book.text.length - 1) {
-          speakFromWordRef.current(nextWordIndex)
-        } else {
-          setCurrentWordIndex(words.length - 1)
-          setIsSpeaking(false)
-          setIsPaused(false)
-          setStatus('Finished')
-        }
-      }
-
-      utterance.onerror = () => {
-        if (isStoppingRef.current) return
-        setIsSpeaking(false)
-        setIsPaused(false)
-        setStatus('Voice playback stopped')
-      }
-
-      utteranceRef.current = utterance
       resumeIndexRef.current = safeWordIndex
       setCurrentWordIndex(safeWordIndex)
       setIsSpeaking(true)
       setIsPaused(false)
-      setStatus('Reading')
-      window.speechSynthesis.speak(utterance)
+      speakTts({
+        text: chunk,
+        engine: settings.ttsEngine,
+        rate: settings.rate,
+        pitch: settings.pitch,
+        volume: settings.volume,
+        kokoroVoiceId: settings.kokoroVoiceId,
+        browserVoice: selectedVoice,
+        boundaryMap,
+        browserStatus: 'Reading',
+        onBoundary: (nextWordIndex) => {
+          resumeIndexRef.current = nextWordIndex
+          setCurrentWordIndex(nextWordIndex)
+        },
+        onEnd: () => {
+          if (isStoppingRef.current) return
+
+          const nextChar = startChar + chunk.length
+          const nextWordIndex = findWordIndexFromChar(words, nextChar + 1)
+
+          if (nextWordIndex < words.length - 1 && nextChar < book.text.length - 1) {
+            speakFromWordRef.current(nextWordIndex)
+          } else {
+            setCurrentWordIndex(words.length - 1)
+            setIsSpeaking(false)
+            setIsPaused(false)
+            setStatus('Finished')
+          }
+        },
+        onError: () => {
+          if (isStoppingRef.current) return
+          setIsSpeaking(false)
+          setIsPaused(false)
+          setStatus('Voice playback stopped')
+        },
+        onStatus: setStatus,
+      })
     },
     [
       book.pdfPages,
@@ -1225,13 +1423,18 @@ function App() {
       book.sourceType,
       book.text,
       buildPdfSpeechChunk,
+      buildTextSpeechBoundaryMap,
       findNextNarratablePdfWord,
       isPdfMathWord,
       pdfRegionsByWord,
       selectedVoice,
+      settings.kokoroVoiceId,
       settings.pitch,
       settings.rate,
+      settings.ttsEngine,
       settings.volume,
+      speakTts,
+      stopTts,
       words,
     ],
   )
@@ -1240,10 +1443,110 @@ function App() {
     speakFromWordRef.current = speakFromWord
   }, [speakFromWord])
 
+  const loadRemoteBooks = useCallback(async () => {
+    if (!supabase || !cloudUser) return
+
+    setCloudStatus('syncing')
+    setCloudMessage('Loading your cloud library')
+
+    const { data, error } = await supabase
+      .from('books')
+      .select(
+        'id,title,source_type,file_path,file_name,file_size,file_last_modified,created_at,last_opened_at',
+      )
+      .order('last_opened_at', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      debugError('Cloud: failed to load books', error)
+      setCloudStatus('error')
+      setCloudMessage('Could not load cloud library')
+      return
+    }
+
+    setRemoteBooks((data ?? []) as RemoteBook[])
+    setCloudStatus('ready')
+    setCloudMessage(data?.length ? 'Cloud sync is ready' : 'Cloud sync is ready for your first book')
+  }, [cloudUser, supabase])
+
+  const loadRemoteSettings = useCallback(async () => {
+    if (!supabase || !cloudUser) return
+
+    const { data, error } = await supabase
+      .from('reader_settings')
+      .select('rate,pitch,volume,voice_uri,profile,focus_mode')
+      .eq('user_id', cloudUser.id)
+      .maybeSingle()
+
+    if (error) {
+      debugError('Cloud: failed to load reader settings', error)
+      return
+    }
+
+    if (data) {
+      setSettings((current) => ({
+        ...normalizeReaderSettings({
+          ...current,
+          ...remoteSettingsToLocal(data as RemoteSettings),
+        }),
+      }))
+    }
+  }, [cloudUser, supabase])
+
+  useEffect(() => {
+    if (!supabase) {
+      return
+    }
+
+    let cancelled = false
+
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (cancelled) return
+
+      if (error) {
+        debugError('Cloud: auth lookup failed', error)
+      }
+
+      const user = data.session?.user ?? null
+
+      setCloudUser(user)
+      setCloudStatus(user ? 'ready' : 'signed-out')
+      setCloudMessage(user ? 'Cloud sync is ready' : 'Sign in to sync across devices')
+    })
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (cancelled) return
+
+      setCloudUser(session?.user ?? null)
+      setCloudStatus(session?.user ? 'ready' : 'signed-out')
+      setCloudMessage(session?.user ? 'Cloud sync is ready' : 'Sign in to sync across devices')
+    })
+
+    return () => {
+      cancelled = true
+      subscription.unsubscribe()
+    }
+  }, [supabase])
+
+  useEffect(() => {
+    if (!supabase || !cloudUser) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      void loadRemoteBooks()
+      void loadRemoteSettings()
+    }, 0)
+
+    return () => window.clearTimeout(timeout)
+  }, [cloudUser, loadRemoteBooks, loadRemoteSettings, supabase])
+
   useEffect(() => {
     try {
       const persistedBook = getPersistableBook(book)
-      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(persistedBook))
+      writeStorage(STORAGE_KEYS.book, persistedBook)
       debugLog('Storage: persisted book shell', {
         id: book.id,
         sourceType: book.sourceType,
@@ -1255,7 +1558,7 @@ function App() {
       debugError('Storage: failed to persist book shell', error)
 
       try {
-        localStorage.removeItem(STORAGE_KEYS.book)
+        window.localStorage.removeItem(STORAGE_KEYS.book)
       } catch (removeError) {
         debugError('Storage: failed to clear book key after quota error', removeError)
       }
@@ -1263,16 +1566,78 @@ function App() {
   }, [book])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings))
-  }, [settings])
+    writeStorage(STORAGE_KEYS.settings, settings)
+
+    if (!supabase || !cloudUser) return
+
+    const timeout = window.setTimeout(() => {
+      setCloudStatus('syncing')
+      void supabase
+        .from('reader_settings')
+        .upsert({
+          user_id: cloudUser.id,
+          rate: settings.rate,
+          pitch: settings.pitch,
+          volume: settings.volume,
+          voice_uri: settings.voiceURI || null,
+          profile: settings.profile,
+          focus_mode: settings.focusMode,
+          updated_at: new Date().toISOString(),
+        })
+        .then(({ error }) => {
+          if (error) {
+            debugError('Cloud: failed to sync settings', error)
+            setCloudStatus('error')
+            setCloudMessage('Settings sync failed')
+            return
+          }
+
+          setCloudStatus('ready')
+          setCloudMessage('Settings synced')
+        })
+    }, 900)
+
+    return () => window.clearTimeout(timeout)
+  }, [cloudUser, settings, supabase])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.bookmarks, JSON.stringify(bookmarks))
+    writeStorage(STORAGE_KEYS.bookmarks, bookmarks)
   }, [bookmarks])
 
   useEffect(() => {
     persistProgress(currentWordIndex)
   }, [currentWordIndex, persistProgress])
+
+  useEffect(() => {
+    if (!supabase || !cloudUser || !isRemoteBookId(book.id)) return
+
+    const pageNumber = pdfRegionsByWord.get(currentWordIndex)?.pageNumber ?? null
+    const timeout = window.setTimeout(() => {
+      setCloudStatus('syncing')
+      void supabase
+        .from('reading_progress')
+        .upsert({
+          user_id: cloudUser.id,
+          book_id: book.id,
+          word_index: currentWordIndex,
+          page_number: pageNumber,
+          updated_at: new Date().toISOString(),
+        })
+        .then(({ error }) => {
+          if (error) {
+            debugError('Cloud: failed to sync progress', error)
+            setCloudStatus('error')
+            setCloudMessage('Progress sync failed')
+            return
+          }
+
+          setCloudStatus('ready')
+          setCloudMessage('Progress synced')
+        })
+    }, 1200)
+
+    return () => window.clearTimeout(timeout)
+  }, [book.id, cloudUser, currentWordIndex, pdfRegionsByWord, supabase])
 
   useEffect(() => {
     pausedImagePagesRef.current.clear()
@@ -1347,6 +1712,7 @@ function App() {
           pages: pdfPageCount,
           urlKind: book.pdfDataUrl.startsWith('blob:') ? 'blob' : 'data',
         })
+        const pdfjsLib = await loadPdfjs()
         const loadingTask = pdfjsLib.getDocument({ data: await dataUrlToUint8Array(book.pdfDataUrl) })
 
         loadingTask.onProgress = (progress: PdfLoadingProgress) => {
@@ -1397,11 +1763,11 @@ function App() {
       if (event.code === 'Space') {
         event.preventDefault()
         if (isSpeaking && !isPaused) {
-          window.speechSynthesis.pause()
+          pauseTts()
           setIsPaused(true)
           setStatus('Paused')
         } else if (isSpeaking && isPaused) {
-          window.speechSynthesis.resume()
+          resumeTts()
           setIsPaused(false)
           setStatus('Reading')
         } else {
@@ -1413,7 +1779,7 @@ function App() {
     window.addEventListener('keydown', handleKeyDown)
 
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [currentWordIndex, isPaused, isSpeaking, settings.focusMode, speakFromWord])
+  }, [currentWordIndex, isPaused, isSpeaking, pauseTts, resumeTts, settings.focusMode, speakFromWord])
 
   useEffect(() => {
     const handleWindowError = (event: ErrorEvent) => {
@@ -1434,16 +1800,190 @@ function App() {
 
     debugLog('App mounted', {
       userAgent: navigator.userAgent,
-      pdfWorker: pdfWorkerUrl,
+      pdfWorker: 'loaded on first PDF use',
     })
 
     return () => {
       isStoppingRef.current = true
-      window.speechSynthesis?.cancel()
+      stopTts()
       window.removeEventListener('error', handleWindowError)
       window.removeEventListener('unhandledrejection', handleUnhandledRejection)
     }
-  }, [])
+  }, [stopTts])
+
+  async function saveImportedBookToCloud(file: File, extracted: ExtractedBook) {
+    if (!supabase || !cloudUser) return null
+
+    setCloudStatus('syncing')
+    setCloudMessage('Uploading original book file')
+
+    const filePath = `${cloudUser.id}/${crypto.randomUUID()}-${safeFileSegment(file.name)}`
+    const { error: uploadError } = await supabase.storage
+      .from(bookStorageBucket)
+      .upload(filePath, file, {
+        contentType: file.type || mimeTypeForSource(extracted.sourceType),
+        upsert: false,
+      })
+
+    if (uploadError) {
+      throw uploadError
+    }
+
+    const { data, error } = await supabase
+      .from('books')
+      .insert({
+        user_id: cloudUser.id,
+        title: extracted.title,
+        source_type: extracted.sourceType,
+        file_path: filePath,
+        file_name: file.name,
+        file_size: file.size,
+        file_last_modified: file.lastModified,
+        last_opened_at: new Date().toISOString(),
+      })
+      .select(
+        'id,title,source_type,file_path,file_name,file_size,file_last_modified,created_at,last_opened_at',
+      )
+      .single()
+
+    if (error) {
+      await supabase.storage.from(bookStorageBucket).remove([filePath])
+      throw error
+    }
+
+    setCloudStatus('ready')
+    setCloudMessage('Book saved to cloud')
+    return data as RemoteBook
+  }
+
+  async function handleCloudSignIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (!supabase || !cloudEmail.trim()) return
+
+    setCloudStatus('syncing')
+    setCloudMessage('Sending sign-in link')
+
+    const { error } = await supabase.auth.signInWithOtp({
+      email: cloudEmail.trim(),
+      options: {
+        emailRedirectTo: window.location.origin,
+      },
+    })
+
+    if (error) {
+      debugError('Cloud: sign-in failed', error)
+      setCloudStatus('error')
+      setCloudMessage(error.message)
+      return
+    }
+
+    setCloudStatus('signed-out')
+    setCloudMessage('Check your email for the sign-in link')
+  }
+
+  async function handleCloudSignOut() {
+    if (!supabase) return
+
+    setCloudStatus('syncing')
+    setCloudMessage('Signing out')
+
+    const { error } = await supabase.auth.signOut()
+
+    if (error) {
+      debugError('Cloud: sign-out failed', error)
+      setCloudStatus('error')
+      setCloudMessage(error.message)
+      return
+    }
+
+    setCloudUser(null)
+    setRemoteBooks([])
+    setCloudStatus('signed-out')
+    setCloudMessage('Signed out of cloud sync')
+  }
+
+  async function openRemoteBook(remoteBook: RemoteBook) {
+    if (!supabase || !cloudUser) return
+
+    try {
+      setStatus(`Opening ${remoteBook.title}`)
+      setCloudStatus('syncing')
+      setCloudMessage('Downloading book')
+      handleStop()
+
+      const { data: fileBlob, error: downloadError } = await supabase.storage
+        .from(bookStorageBucket)
+        .download(remoteBook.file_path)
+
+      if (downloadError) throw downloadError
+      if (!fileBlob) throw new Error('Cloud book file was empty.')
+
+      const file = new File([fileBlob], remoteBook.file_name, {
+        type: mimeTypeForSource(remoteBook.source_type),
+        lastModified: remoteBook.file_last_modified ?? Date.now(),
+      })
+      const extracted = await extractBook(file, (message) => {
+        setStatus(message)
+        debugLog('Cloud: open progress', { bookId: remoteBook.id, message })
+      })
+      const { data: remoteProgress, error: progressError } = await supabase
+        .from('reading_progress')
+        .select('book_id,word_index,page_number')
+        .eq('book_id', remoteBook.id)
+        .maybeSingle()
+      const { data: remoteBookmarks, error: bookmarksError } = await supabase
+        .from('bookmarks')
+        .select('id,book_id,label,word_index,created_at')
+        .eq('book_id', remoteBook.id)
+        .order('created_at', { ascending: false })
+
+      if (progressError) {
+        debugError('Cloud: failed to load progress for book', progressError)
+      }
+
+      if (bookmarksError) {
+        debugError('Cloud: failed to load bookmarks for book', bookmarksError)
+      }
+
+      const progressRow = remoteProgress as RemoteProgress | null
+      const localBookmarks = ((remoteBookmarks ?? []) as RemoteBookmark[]).map(remoteBookmarkToLocal)
+      const remoteWordCount = splitWords(extracted.text).length
+      const nextBook: ReaderBook = {
+        ...extracted,
+        id: remoteBook.id,
+        title: remoteBook.title,
+        importedAt: Date.parse(remoteBook.created_at),
+      }
+
+      setBook(nextBook)
+      setCurrentWordIndex(
+        Math.max(0, Math.min(progressRow?.word_index ?? 0, Math.max(remoteWordCount - 1, 0))),
+      )
+      setBookmarks((current) => [
+        ...localBookmarks,
+        ...current.filter((bookmark) => !bookmark.id.startsWith(`${remoteBook.id}:`)),
+      ])
+      setVisualPausePage(null)
+      setIsSpeaking(false)
+      setIsPaused(false)
+
+      await supabase
+        .from('books')
+        .update({ last_opened_at: new Date().toISOString() })
+        .eq('id', remoteBook.id)
+      await loadRemoteBooks()
+
+      setCloudStatus('ready')
+      setCloudMessage('Cloud book opened')
+      setStatus('Book opened from cloud')
+    } catch (error) {
+      debugError('Cloud: failed to open book', error)
+      setCloudStatus('error')
+      setCloudMessage('Could not open cloud book')
+      setStatus(error instanceof Error ? error.message : 'Could not open cloud book')
+    }
+  }
 
   async function handleFile(file: File) {
     const importRun = importRunRef.current + 1
@@ -1477,23 +2017,38 @@ function App() {
         throw new Error('No readable text was found in this file.')
       }
 
+      let remoteBook: RemoteBook | null = null
+
+      if (supabase && cloudUser) {
+        try {
+          remoteBook = await saveImportedBookToCloud(file, extracted)
+          await loadRemoteBooks()
+        } catch (cloudError) {
+          debugError('Cloud: failed to save imported book', cloudError)
+          setCloudStatus('error')
+          setCloudMessage('Book imported locally; cloud upload failed')
+        }
+      }
+
       const nextBook: ReaderBook = {
         ...extracted,
-        id: `${file.name}:${file.size}:${file.lastModified}`,
+        id: remoteBook?.id ?? `${file.name}:${file.size}:${file.lastModified}`,
         importedAt: Date.now(),
       }
 
       isStoppingRef.current = true
-      window.speechSynthesis.cancel()
+      stopTts()
       setBook(nextBook)
       setCurrentWordIndex(0)
       setIsSpeaking(false)
       setIsPaused(false)
       setVisualPausePage(null)
       setStatus(
-        nextBook.sourceType === 'pdf' && nextBook.pdfRegions?.length === 0
-          ? 'PDF imported visually; no selectable text'
-          : 'Book imported',
+        remoteBook
+          ? 'Book imported and synced'
+          : nextBook.sourceType === 'pdf' && nextBook.pdfRegions?.length === 0
+            ? 'PDF imported visually; no selectable text'
+            : 'Book imported',
       )
       debugLog('Upload: book committed to state', {
         importRun,
@@ -1518,14 +2073,14 @@ function App() {
 
   function handlePlayPause() {
     if (isSpeaking && !isPaused) {
-      window.speechSynthesis.pause()
+      pauseTts()
       setIsPaused(true)
       setStatus('Paused')
       return
     }
 
     if (isSpeaking && isPaused) {
-      window.speechSynthesis.resume()
+      resumeTts()
       setIsPaused(false)
       setStatus('Reading')
       return
@@ -1536,7 +2091,7 @@ function App() {
 
   function handleStop() {
     isStoppingRef.current = true
-    window.speechSynthesis.cancel()
+    stopTts()
     setIsSpeaking(false)
     setIsPaused(false)
     setVisualPausePage(null)
@@ -1549,7 +2104,7 @@ function App() {
 
     if (isSpeaking) {
       isStoppingRef.current = true
-      window.speechSynthesis.cancel()
+      stopTts()
       setIsSpeaking(false)
       setIsPaused(false)
     }
@@ -1571,13 +2126,52 @@ function App() {
     }))
   }
 
-  function handlePdfDoubleClick(event: React.MouseEvent) {
-    const pageNode = (event.target as Element).closest('.pdf-page') as HTMLElement
-    if (!pageNode) return
-    const pageMatch = pageNode.getAttribute('aria-label')?.match(/\d+/)
-    if (!pageMatch) return
-    const pageNumber = Number(pageMatch[0])
-    const rect = pageNode.getBoundingClientRect()
+  function startReadingAtWord(wordIndex: number) {
+    const safeWordIndex = Math.max(0, Math.min(wordIndex, Math.max(words.length - 1, 0)))
+
+    speakFromWord(safeWordIndex)
+    requestAnimationFrame(() => {
+      const activeNode = activeWordRef.current ?? activePdfRegionRef.current
+      activeNode?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  }
+
+  function findPdfRegionAtPoint(pageNumber: number, pdfX: number, pdfY: number) {
+    const pageRegions = book.pdfRegions?.filter((region) => region.pageNumber === pageNumber) ?? []
+    let closestRegion: PdfTextRegion | null = null
+    let minDistance = Infinity
+
+    for (const region of pageRegions) {
+      const horizontalPadding = Math.max(region.height * 0.7, 4)
+      const verticalPadding = Math.max(region.height * 0.5, 3)
+      const left = region.left - horizontalPadding
+      const right = region.left + region.width + horizontalPadding
+      const top = region.top - verticalPadding
+      const bottom = region.top + region.height + verticalPadding
+      const dx = pdfX < left ? left - pdfX : pdfX > right ? pdfX - right : 0
+      const dy = pdfY < top ? top - pdfY : pdfY > bottom ? pdfY - bottom : 0
+      const distance = Math.hypot(dx, dy)
+
+      if (distance < minDistance) {
+        minDistance = distance
+        closestRegion = region
+      }
+    }
+
+    return minDistance <= 2 ? closestRegion : null
+  }
+
+  function handlePdfClick(event: ReactMouseEvent) {
+    const target = event.target as Element
+
+    if (target.closest('.pdf-toolbar, button, input, select')) return
+
+    const pageNode = target.closest('.pdf-page-container') as HTMLElement | null
+    const pageSurface = target.closest('.pdf-page') as HTMLElement | null
+    if (!pageNode || !pageSurface) return
+    const pageNumber = Number(pageNode.dataset.pageNumber)
+    if (!pageNumber) return
+    const rect = pageSurface.getBoundingClientRect()
     const relativeX = event.clientX - rect.left
     const relativeY = event.clientY - rect.top
 
@@ -1586,32 +2180,16 @@ function App() {
 
     const pdfX = (relativeX / rect.width) * pageInfo.width
     const pdfY = (relativeY / rect.height) * pageInfo.height
-
-    let closestRegion = null
-    let minDistance = Infinity
-
-    const pageRegions = book.pdfRegions?.filter((r) => r.pageNumber === pageNumber) || []
-    for (const region of pageRegions) {
-      const regionCenterX = region.left + region.width / 2
-      const regionCenterY = region.top + region.height / 2
-      const distance = Math.hypot(regionCenterX - pdfX, regionCenterY - pdfY)
-      if (distance < minDistance) {
-        minDistance = distance
-        closestRegion = region
-      }
-    }
+    const closestRegion = findPdfRegionAtPoint(pageNumber, pdfX, pdfY)
 
     if (closestRegion) {
-      jumpToWord(closestRegion.wordIndex)
-      if (!isSpeaking || isPaused) {
-        handlePlayPause()
-      }
+      startReadingAtWord(closestRegion.wordIndex)
     }
   }
 
   function getVisibleWordIndex() {
     if (isPdfVisualReader) {
-      const pages = Array.from(document.querySelectorAll('.pdf-page'))
+      const pages = Array.from(document.querySelectorAll('.pdf-page-container'))
       let bestPageNumber = 1
       let minDistance = Infinity
 
@@ -1623,11 +2201,7 @@ function App() {
 
         if (distance < minDistance) {
           minDistance = distance
-          const label = page.getAttribute('aria-label')
-          const numMatch = label?.match(/\d+/)
-          if (numMatch) {
-            bestPageNumber = Number(numMatch[0])
-          }
+          bestPageNumber = Number((page as HTMLElement).dataset.pageNumber) || bestPageNumber
         }
       }
 
@@ -1657,10 +2231,7 @@ function App() {
 
   function playFromCurrentView() {
     const targetWordIndex = getVisibleWordIndex()
-    jumpToWord(targetWordIndex)
-    if (!isSpeaking || isPaused) {
-      handlePlayPause()
-    }
+    startReadingAtWord(targetWordIndex)
   }
 
   function handleJumpToPage() {
@@ -1694,6 +2265,39 @@ function App() {
 
     setBookmarks((current) => [bookmark, ...current])
     setStatus('Bookmark saved')
+
+    if (supabase && cloudUser && isRemoteBookId(book.id)) {
+      void supabase
+        .from('bookmarks')
+        .insert({
+          user_id: cloudUser.id,
+          book_id: book.id,
+          word_index: bookmark.wordIndex,
+          label: bookmark.label,
+        })
+        .select('id,book_id,label,word_index,created_at')
+        .single()
+        .then(({ data, error }) => {
+          if (error) {
+            debugError('Cloud: failed to sync bookmark', error)
+            setCloudStatus('error')
+            setCloudMessage('Bookmark saved locally; cloud sync failed')
+            return
+          }
+
+          const remoteBookmark = data as RemoteBookmark | null
+          if (remoteBookmark) {
+            setBookmarks((current) =>
+              current.map((candidate) =>
+                candidate.id === bookmark.id ? remoteBookmarkToLocal(remoteBookmark) : candidate,
+              ),
+            )
+          }
+
+          setCloudStatus('ready')
+          setCloudMessage('Bookmark synced')
+        })
+    }
   }
 
   function clearBook() {
@@ -1712,11 +2316,20 @@ function App() {
 
   const appClassName = [
     'app',
+    `theme-${settings.theme}`,
     settings.focusMode ? 'app-focus' : '',
     settings.focusMode && !focusControlsVisible ? 'focus-controls-hidden' : '',
   ]
     .filter(Boolean)
     .join(' ')
+  const textReaderStyle = {
+    '--reader-text-scale': settings.textScale,
+    '--reader-line-height': settings.lineHeight,
+    '--reader-font-family':
+      settings.fontFamily === 'serif'
+        ? "Georgia, 'Times New Roman', serif"
+        : "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+  } as CSSProperties
 
   return (
     <main className={appClassName} onPointerDown={revealFocusControls} onPointerMove={revealFocusControls}>
@@ -1755,6 +2368,70 @@ function App() {
           />
         </label>
 
+        <section className="control-group cloud-group" aria-labelledby="cloud-heading">
+          <div className="section-title">
+            <Cloud aria-hidden="true" />
+            <h2 id="cloud-heading">Cloud sync</h2>
+          </div>
+          <p className={`cloud-status cloud-status-${cloudStatus}`}>{cloudMessage}</p>
+
+          {cloudStatus === 'disabled' ? (
+            <p className="cloud-help">Add Supabase env vars on Vercel to sync books and progress.</p>
+          ) : cloudUser ? (
+            <>
+              <div className="cloud-account">
+                <span>{cloudUser.email ?? 'Signed in'}</span>
+                <button type="button" onClick={handleCloudSignOut} title="Sign out">
+                  <LogOut aria-hidden="true" />
+                </button>
+              </div>
+              <div className="cloud-actions">
+                <button type="button" onClick={loadRemoteBooks} disabled={cloudStatus === 'syncing'}>
+                  <RefreshCw aria-hidden="true" />
+                  <span>Refresh</span>
+                </button>
+              </div>
+              {remoteBooks.length === 0 ? (
+                <p className="cloud-help">Uploaded books will appear here after sync.</p>
+              ) : (
+                <div className="cloud-book-list">
+                  {remoteBooks.map((remoteBook) => (
+                    <button
+                      type="button"
+                      key={remoteBook.id}
+                      onClick={() => void openRemoteBook(remoteBook)}
+                    >
+                      <span>{remoteBook.title}</span>
+                      <small>
+                        {remoteBook.source_type.toUpperCase()}
+                        {remoteBook.file_size
+                          ? ` · ${(remoteBook.file_size / 1024 / 1024).toFixed(1)} MB`
+                          : ''}
+                      </small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <form className="cloud-signin" onSubmit={handleCloudSignIn}>
+              <label className="field">
+                <span>Email</span>
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  value={cloudEmail}
+                  onChange={(event) => setCloudEmail(event.target.value)}
+                />
+              </label>
+              <button type="submit" disabled={!cloudEmail.trim() || cloudStatus === 'syncing'}>
+                <Mail aria-hidden="true" />
+                <span>Send link</span>
+              </button>
+            </form>
+          )}
+        </section>
+
         <section className="control-group" aria-labelledby="playback-heading">
           <div className="section-title">
             <Volume2 aria-hidden="true" />
@@ -1780,20 +2457,48 @@ function App() {
           <label className="field">
             <span>Voice</span>
             <select
-              value={settings.voiceURI}
-              onChange={(event) =>
-                setSettings((current) => ({ ...current, voiceURI: event.target.value }))
-              }
+              value={selectedVoiceValue}
+              onChange={(event) => {
+                const value = event.target.value
+
+                if (value.startsWith('kokoro:')) {
+                  const voiceId = value.slice('kokoro:'.length)
+
+                  if (!isKokoroVoiceId(voiceId)) return
+
+                  setSettings((current) => ({
+                    ...current,
+                    ttsEngine: 'kokoro',
+                    kokoroVoiceId: voiceId,
+                  }))
+                  return
+                }
+
+                setSettings((current) => ({
+                  ...current,
+                  ttsEngine: 'browser',
+                  voiceURI: value.startsWith('browser:') ? value.slice('browser:'.length) : '',
+                }))
+              }}
             >
-              {voices.length === 0 ? (
-                <option value="">Browser default voice</option>
-              ) : (
-                voices.map((voice) => (
-                  <option value={voice.voiceURI} key={voice.voiceURI}>
-                    {voice.name} ({voice.lang})
+              <optgroup label="Local AI voices">
+                {KOKORO_VOICES.map((voice) => (
+                  <option value={`kokoro:${voice.id}`} key={voice.id}>
+                    {voice.label} ({voice.locale}) - {voice.description}
                   </option>
-                ))
-              )}
+                ))}
+              </optgroup>
+              <optgroup label="Browser voices">
+                {voices.length === 0 ? (
+                  <option value="browser:">Browser default voice</option>
+                ) : (
+                  voices.map((voice) => (
+                    <option value={`browser:${voice.voiceURI}`} key={voice.voiceURI}>
+                      {voice.name} ({voice.lang})
+                    </option>
+                  ))
+                )}
+              </optgroup>
             </select>
           </label>
 
@@ -1865,6 +2570,86 @@ function App() {
           </div>
         </section>
 
+        <section className="control-group" aria-labelledby="appearance-heading">
+          <div className="section-title">
+            {settings.theme === 'dark' ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}
+            <h2 id="appearance-heading">Reading mode</h2>
+          </div>
+
+          <label className="field">
+            <span>Theme</span>
+            <select
+              value={settings.theme}
+              onChange={(event) =>
+                setSettings((current) => ({
+                  ...current,
+                  theme: event.target.value as ReaderTheme,
+                }))
+              }
+            >
+              {Object.entries(READER_THEMES).map(([theme, label]) => (
+                <option value={theme} key={theme}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Font</span>
+            <select
+              value={settings.fontFamily}
+              onChange={(event) =>
+                setSettings((current) => ({
+                  ...current,
+                  fontFamily: event.target.value as ReaderFont,
+                }))
+              }
+            >
+              {Object.entries(READER_FONTS).map(([font, label]) => (
+                <option value={font} key={font}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div className="slider-grid">
+            <label>
+              <span>Text size {Math.round(settings.textScale * 100)}%</span>
+              <input
+                type="range"
+                min="0.85"
+                max="1.35"
+                step="0.05"
+                value={settings.textScale}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    textScale: Number(event.target.value),
+                  }))
+                }
+              />
+            </label>
+            <label>
+              <span>Line spacing {settings.lineHeight.toFixed(2)}</span>
+              <input
+                type="range"
+                min="1.45"
+                max="2.15"
+                step="0.05"
+                value={settings.lineHeight}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    lineHeight: Number(event.target.value),
+                  }))
+                }
+              />
+            </label>
+          </div>
+        </section>
+
         <section className="control-group" aria-labelledby="tools-heading">
           <div className="section-title">
             <Gauge aria-hidden="true" />
@@ -1877,6 +2662,19 @@ function App() {
           <button type="button" className="tool-button" onClick={playFromCurrentView}>
             <Play aria-hidden="true" />
             <span>Play from view</span>
+          </button>
+          <button
+            type="button"
+            className={settings.theme === 'dark' ? 'tool-button is-active' : 'tool-button'}
+            onClick={() =>
+              setSettings((current) => ({
+                ...current,
+                theme: current.theme === 'dark' ? 'light' : 'dark',
+              }))
+            }
+          >
+            {settings.theme === 'dark' ? <Check aria-hidden="true" /> : <Moon aria-hidden="true" />}
+            <span>Dark mode</span>
           </button>
           <button
             type="button"
@@ -1928,8 +2726,14 @@ function App() {
               ref={readerRef} 
               className="reader-page pdf-reader" 
               aria-label="Rendered PDF"
-              onDoubleClick={handlePdfDoubleClick}
-              style={{ '--pdf-zoom': pdfZoom } as React.CSSProperties}
+              onClick={handlePdfClick}
+              style={
+                {
+                  '--pdf-zoom': pdfZoom,
+                  '--reader-text-scale': settings.textScale,
+                  '--reader-line-height': settings.lineHeight,
+                } as CSSProperties
+              }
             >
               <div className="pdf-toolbar">
                 <button
@@ -1977,7 +2781,7 @@ function App() {
                   )}
                   forceInitialRender={pageInfo.pageNumber <= 2}
                   onImageDetected={markPdfPageHasImages}
-                  onJump={jumpToWord}
+                  onStartFromWord={startReadingAtWord}
                   pageInfo={pageInfo}
                   pdfDocument={pdfDocument}
                   registerActiveRegion={(node) => {
@@ -1998,7 +2802,12 @@ function App() {
               </div>
             </article>
           ) : (
-            <article ref={readerRef} className="reader-page" aria-label="Book text">
+            <article
+              ref={readerRef}
+              className="reader-page"
+              aria-label="Book text"
+              style={textReaderStyle}
+            >
               {tokens.map((token) =>
                 token.kind === 'space' ? (
                   <span key={`s-${token.tokenIndex}`}>{token.value}</span>
@@ -2063,7 +2872,7 @@ function App() {
                 <span>
                   {book.sourceType === 'pdf'
                     ? `${book.pdfPages?.length ?? 0} pages, ${book.mathRegionCount ?? 0} math stops`
-                    : (selectedVoice?.name ?? 'Default voice')}
+                    : selectedVoiceLabel}
                 </span>
               </div>
             </div>
