@@ -388,9 +388,15 @@ input[type='range'] {
   position: relative;
   justify-self: center;
   overflow: hidden;
+  background: white;
   border-radius: 4px;
-  background: #fff;
-  box-shadow: 0 16px 34px rgba(15, 26, 31, 0.16);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.pdf-page::before {
+  content: "";
+  display: block;
+  padding-bottom: var(--ar-padding);
 }
 
 .pdf-page canvas {

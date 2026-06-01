@@ -686,7 +686,7 @@ function PdfPageView({
     <section
       ref={pageRef}
       className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
-      style={{ paddingBottom: `${(pageInfo.height / pageInfo.width) * 100}%` }}
+      style={{ '--ar-padding': `${(pageInfo.height / pageInfo.width) * 100}%` } as React.CSSProperties}
       aria-label={`PDF page ${pageInfo.pageNumber}`}
     >
       <canvas ref={canvasRef} aria-hidden="true" />
