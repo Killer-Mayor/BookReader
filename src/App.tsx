@@ -161,6 +161,7 @@ const CHUNK_LIMIT = 2800
 const PDF_CHUNK_WORD_LIMIT = 95
 const PDF_EQUATION_PAUSE_MS = 1100
 const PDF_IMPORT_YIELD_EVERY_PAGES = 3
+const MAX_PERSISTED_BOOK_CHARS = 250_000
 const DEBUG_PREFIX = '[AudioReader]'
 const MATH_TEXT_PATTERN =
   /([=<>≤≥≈≠∑∫√∞±×÷∂∆∇πµΩα-ωΑ-Ω^_{}|])|(\d+\s*[+\-*/=]\s*\d)|(\b[a-z]\s*[=<>]\s*)/i
@@ -201,6 +202,33 @@ function normalizeText(text: string) {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{4,}/g, '\n\n\n')
     .trim()
+}
+
+function getPersistableBook(book: ReaderBook): ReaderBook {
+  if (book.sourceType === 'pdf') {
+    return {
+      id: book.id,
+      title: book.title,
+      sourceType: 'pdf',
+      text:
+        'This PDF was opened in a previous browser session. Re-upload the file to restore the rendered pages and narration map.',
+      importedAt: book.importedAt,
+      mathRegionCount: book.mathRegionCount,
+    }
+  }
+
+  if (book.text.length > MAX_PERSISTED_BOOK_CHARS) {
+    return {
+      id: book.id,
+      title: book.title,
+      sourceType: book.sourceType,
+      text:
+        'This book is too large to save fully in browser storage. Re-upload it to continue from saved progress.',
+      importedAt: book.importedAt,
+    }
+  }
+
+  return book
 }
 
 async function dataUrlToUint8Array(dataUrl: string) {
@@ -512,11 +540,44 @@ function PdfPageView({
   pdfDocument: PdfDocumentProxy
   registerActiveRegion: (node: HTMLButtonElement | null) => void
 }) {
+  const pageRef = useRef<HTMLElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const shouldForceRender = activeRegions.length > 0
+  const [isNearViewport, setIsNearViewport] = useState(false)
   const [isRendered, setIsRendered] = useState(false)
 
   useEffect(() => {
+    const pageNode = pageRef.current
+
+    if (!pageNode) return
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setIsNearViewport(entry.isIntersecting)
+      },
+      { root: null, rootMargin: '900px 0px', threshold: 0.01 },
+    )
+
+    observer.observe(pageNode)
+
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
+    const shouldRender = isNearViewport || shouldForceRender
+
+    if (!shouldRender) {
+      const canvas = canvasRef.current
+
+      if (canvas) {
+        canvas.width = 0
+        canvas.height = 0
+      }
+
+      window.setTimeout(() => setIsRendered(false), 0)
+      return
+    }
 
     async function renderPage() {
       const canvas = canvasRef.current
@@ -566,10 +627,19 @@ function PdfPageView({
     return () => {
       cancelled = true
     }
-  }, [onImageDetected, pageInfo.height, pageInfo.pageNumber, pageInfo.width, pdfDocument])
+  }, [
+    isNearViewport,
+    onImageDetected,
+    pageInfo.height,
+    pageInfo.pageNumber,
+    pageInfo.width,
+    pdfDocument,
+    shouldForceRender,
+  ])
 
   return (
     <section
+      ref={pageRef}
       className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
       style={{ aspectRatio: `${pageInfo.width} / ${pageInfo.height}` }}
       aria-label={`PDF page ${pageInfo.pageNumber}`}
@@ -739,7 +809,10 @@ function App() {
   const importRunRef = useRef(0)
 
   const words = useMemo(() => splitWords(book.text), [book.text])
-  const tokens = useMemo(() => buildTokens(book.text, words), [book.text, words])
+  const tokens = useMemo(
+    () => (book.sourceType === 'pdf' ? [] : buildTokens(book.text, words)),
+    [book.sourceType, book.text, words],
+  )
   const progress = words.length > 0 ? Math.min((currentWordIndex / words.length) * 100, 100) : 0
   const currentWord = words[currentWordIndex]?.text ?? ''
   const minutesRemaining = estimateMinutesRemaining(words.length, currentWordIndex, settings.rate)
@@ -787,6 +860,14 @@ function App() {
 
     return regions
   }, [book.pdfPages, currentWordIndex, pdfRegionsByWord, visualPausePage, words.length])
+  const activePdfPageNumber = activePdfRegions[0]?.pageNumber ?? pdfRegionsByWord.get(currentWordIndex)?.pageNumber ?? 1
+  const visiblePdfPages = useMemo(() => {
+    if (!book.pdfPages?.length) return []
+
+    return book.pdfPages.filter(
+      (pageInfo) => Math.abs(pageInfo.pageNumber - activePdfPageNumber) <= 1,
+    )
+  }, [activePdfPageNumber, book.pdfPages])
   const isPdfVisualReader = book.sourceType === 'pdf' && !!pdfDocument && pdfPageCount > 0
   const searchMatchIndex = useMemo(() => {
     if (!query.trim()) return -1
@@ -843,6 +924,12 @@ function App() {
       }
     },
     [isPdfMathWord, words],
+  )
+
+  const firstWordOnPdfPage = useCallback(
+    (pageNumber: number) =>
+      book.pdfRegions?.find((region) => region.pageNumber === pageNumber)?.wordIndex ?? 0,
+    [book.pdfRegions],
   )
 
   const markPdfPageHasImages = useCallback((pageNumber: number) => {
@@ -1101,20 +1188,23 @@ function App() {
 
   useEffect(() => {
     try {
-      const persistedBook = { ...book }
-
-      if (persistedBook.pdfDataUrl?.startsWith('blob:')) {
-        delete persistedBook.pdfDataUrl
-      }
-
+      const persistedBook = getPersistableBook(book)
       localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(persistedBook))
-    } catch {
-      debugError('Storage: failed to persist book', { id: book.id, sourceType: book.sourceType })
-      if (!book.pdfDataUrl) return
+      debugLog('Storage: persisted book shell', {
+        id: book.id,
+        sourceType: book.sourceType,
+        originalCharacters: book.text.length,
+        persistedCharacters: persistedBook.text.length,
+        persistedRegions: persistedBook.pdfRegions?.length ?? 0,
+      })
+    } catch (error) {
+      debugError('Storage: failed to persist book shell', error)
 
-      const bookWithoutPdfBytes = { ...book }
-      delete bookWithoutPdfBytes.pdfDataUrl
-      localStorage.setItem(STORAGE_KEYS.book, JSON.stringify(bookWithoutPdfBytes))
+      try {
+        localStorage.removeItem(STORAGE_KEYS.book)
+      } catch (removeError) {
+        debugError('Storage: failed to clear book key after quota error', removeError)
+      }
     }
   }, [book])
 
@@ -1634,7 +1724,28 @@ function App() {
         <div className="reader-layout">
           {isPdfVisualReader ? (
             <article ref={readerRef} className="reader-page pdf-reader" aria-label="Rendered PDF">
-              {book.pdfPages?.map((pageInfo) => (
+              <div className="pdf-window-toolbar">
+                <button
+                  type="button"
+                  onClick={() => jumpToWord(firstWordOnPdfPage(Math.max(activePdfPageNumber - 1, 1)))}
+                  disabled={activePdfPageNumber <= 1}
+                >
+                  Previous page
+                </button>
+                <span>
+                  Page {activePdfPageNumber} of {pdfPageCount}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    jumpToWord(firstWordOnPdfPage(Math.min(activePdfPageNumber + 1, pdfPageCount)))
+                  }
+                  disabled={activePdfPageNumber >= pdfPageCount}
+                >
+                  Next page
+                </button>
+              </div>
+              {visiblePdfPages.map((pageInfo) => (
                 <PdfPageView
                   key={pageInfo.pageNumber}
                   activeRegions={activePdfRegions.filter(
@@ -1649,6 +1760,21 @@ function App() {
                   }}
                 />
               ))}
+              <div className="pdf-window-note">
+                Rendering pages {visiblePdfPages[0]?.pageNumber ?? activePdfPageNumber}-
+                {visiblePdfPages.at(-1)?.pageNumber ?? activePdfPageNumber} for speed.
+              </div>
+            </article>
+          ) : book.sourceType === 'pdf' ? (
+            <article ref={readerRef} className="reader-page pdf-reader" aria-label="Loading PDF">
+              <div className="pdf-loading-state">
+                <FileText aria-hidden="true" />
+                <h3>{pdfRenderStatus || status || 'Preparing PDF view'}</h3>
+                <p>
+                  Imported {pdfPageCount.toLocaleString()} pages and {words.length.toLocaleString()}{' '}
+                  words. The rendered page view is loading now.
+                </p>
+              </div>
             </article>
           ) : (
             <article ref={readerRef} className="reader-page" aria-label="Book text">

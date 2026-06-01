@@ -351,6 +351,83 @@ input[type='range'] {
   white-space: normal;
 }
 
+.pdf-window-toolbar {
+  width: min(100%, 920px);
+  justify-self: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.pdf-window-toolbar button {
+  min-height: 36px;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #fff;
+  background: #16384f;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.pdf-window-toolbar button:first-child {
+  justify-self: start;
+}
+
+.pdf-window-toolbar button:last-child {
+  justify-self: end;
+}
+
+.pdf-window-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.pdf-window-toolbar span,
+.pdf-window-note {
+  color: #425154;
+  font-size: 0.85rem;
+  font-weight: 800;
+}
+
+.pdf-window-note {
+  justify-self: center;
+}
+
+.pdf-loading-state {
+  width: min(100%, 560px);
+  min-height: 340px;
+  justify-self: center;
+  align-self: center;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  padding: 28px;
+  border-radius: 8px;
+  text-align: center;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.pdf-loading-state svg {
+  width: 38px;
+  height: 38px;
+  color: #28726d;
+}
+
+.pdf-loading-state h3,
+.pdf-loading-state p {
+  margin: 0;
+}
+
+.pdf-loading-state p {
+  color: var(--muted);
+}
+
 .pdf-page {
   width: min(100%, 920px);
   position: relative;
