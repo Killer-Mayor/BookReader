@@ -685,41 +685,46 @@ function PdfPageView({
   return (
     <section
       ref={pageRef}
-      className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
-      style={{ paddingBottom: `${(pageInfo.height / pageInfo.width) * 100}%` }}
+      className="pdf-page-container"
+      data-page-number={pageInfo.pageNumber}
       aria-label={`PDF page ${pageInfo.pageNumber}`}
     >
-      <canvas ref={canvasRef} aria-hidden="true" />
-      <div className="pdf-page-number">Page {pageInfo.pageNumber}</div>
-      {activeRegions.map((region, index) => (
-        <button
-          type="button"
-          key={`${region.wordIndex}-${index}`}
-          ref={index === 0 ? registerActiveRegion : undefined}
-          className={[
-            'pdf-region',
-            'is-active',
-            region.isMath ? 'is-math' : '',
-            region.isVisual ? 'is-visual' : '',
-          ]
-            .filter(Boolean)
-            .join(' ')}
-          style={{
-            left: `${(region.left / pageInfo.width) * 100}%`,
-            top: `${(region.top / pageInfo.height) * 100}%`,
-            width: `${(region.width / pageInfo.width) * 100}%`,
-            height: `${(region.height / pageInfo.height) * 100}%`,
-          }}
-          onClick={() => onJump(region.wordIndex)}
-          aria-label={
-            region.isVisual
-              ? 'Visual page pause region'
-              : region.isMath
-                ? 'Equation pause region'
-                : 'Current read region'
-          }
-        />
-      ))}
+      <div 
+        className={isRendered ? 'pdf-page is-rendered' : 'pdf-page'}
+        style={{ paddingBottom: `${(pageInfo.height / pageInfo.width) * 100}%` }}
+      >
+        <canvas ref={canvasRef} aria-hidden="true" />
+        <div className="pdf-page-number">Page {pageInfo.pageNumber}</div>
+        {activeRegions.map((region, index) => (
+          <button
+            type="button"
+            key={`${region.wordIndex}-${index}`}
+            ref={index === 0 ? registerActiveRegion : undefined}
+            className={[
+              'pdf-region',
+              'is-active',
+              region.isMath ? 'is-math' : '',
+              region.isVisual ? 'is-visual' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            style={{
+              left: `${(region.left / pageInfo.width) * 100}%`,
+              top: `${(region.top / pageInfo.height) * 100}%`,
+              width: `${(region.width / pageInfo.width) * 100}%`,
+              height: `${(region.height / pageInfo.height) * 100}%`,
+            }}
+            onClick={() => onJump(region.wordIndex)}
+            aria-label={
+              region.isVisual
+                ? 'Visual page pause region'
+                : region.isMath
+                  ? 'Equation pause region'
+                  : 'Current read region'
+            }
+          />
+        ))}
+      </div>
     </section>
   )
 }
@@ -1661,11 +1666,17 @@ function App() {
   function handleJumpToPage() {
     const targetPage = Number(pdfPageInput)
     if (!targetPage || isNaN(targetPage)) return
-    const region = book.pdfRegions?.find((r) => r.pageNumber === targetPage)
+    const safePage = Math.max(1, Math.min(targetPage, Math.max(pdfPageCount, 1)))
+    const region = book.pdfRegions?.find((r) => r.pageNumber === safePage)
+    const pageNode = document.querySelector(`[data-page-number="${safePage}"]`)
+
+    pageNode?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
     if (region) {
       jumpToWord(region.wordIndex)
-      setPdfPageInput('')
     }
+
+    setPdfPageInput('')
   }
 
   function addBookmark() {
@@ -1907,44 +1918,6 @@ function App() {
           </div>
         </header>
 
-        {book.sourceType === 'pdf' && (
-          <div className="pdf-toolbar">
-            <button
-              type="button"
-              onClick={() => setPdfZoom((z) => Math.max(0.5, z - 0.25))}
-              title="Zoom out"
-            >
-              <ZoomOut aria-hidden="true" />
-              <span>Zoom out</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setPdfZoom((z) => Math.min(2.5, z + 0.25))}
-              title="Zoom in"
-            >
-              <ZoomIn aria-hidden="true" />
-              <span>Zoom in</span>
-            </button>
-            <span>{Math.round(pdfZoom * 100)}%</span>
-
-            <div className="page-input">
-              <Navigation aria-hidden="true" style={{ width: 14, height: 14 }} />
-              <input
-                type="number"
-                placeholder="Page"
-                min={1}
-                max={pdfPageCount}
-                value={pdfPageInput}
-                onChange={(e) => setPdfPageInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleJumpToPage()
-                }}
-              />
-              <span className="page-count">of {pdfPageCount}</span>
-            </div>
-          </div>
-        )}
-
         <div className="progress-rail" aria-label={`Reading progress ${Math.round(progress)}%`}>
           <span style={{ width: `${progress}%` }} />
         </div>
@@ -1958,6 +1931,44 @@ function App() {
               onDoubleClick={handlePdfDoubleClick}
               style={{ '--pdf-zoom': pdfZoom } as React.CSSProperties}
             >
+              <div className="pdf-toolbar">
+                <button
+                  type="button"
+                  onClick={() => setPdfZoom((z) => Math.max(0.5, z - 0.25))}
+                  title="Zoom out"
+                >
+                  <ZoomOut aria-hidden="true" />
+                  <span>Zoom out</span>
+                </button>
+                <span className="pdf-zoom-value">{Math.round(pdfZoom * 100)}%</span>
+                <button
+                  type="button"
+                  onClick={() => setPdfZoom((z) => Math.min(2.5, z + 0.25))}
+                  title="Zoom in"
+                >
+                  <ZoomIn aria-hidden="true" />
+                  <span>Zoom in</span>
+                </button>
+
+                <div className="page-input">
+                  <Navigation aria-hidden="true" />
+                  <input
+                    type="number"
+                    placeholder="Page"
+                    min={1}
+                    max={pdfPageCount}
+                    value={pdfPageInput}
+                    onChange={(e) => setPdfPageInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleJumpToPage()
+                    }}
+                  />
+                  <span className="page-count">of {pdfPageCount}</span>
+                  <button type="button" onClick={handleJumpToPage}>
+                    Go
+                  </button>
+                </div>
+              </div>
               {book.pdfPages?.map((pageInfo) => (
                 <PdfPageView
                   key={pageInfo.pageNumber}

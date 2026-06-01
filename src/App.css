@@ -344,11 +344,90 @@ input[type='range'] {
 
 .pdf-reader {
   display: grid;
+  grid-template-columns: 1fr;
   gap: 22px;
+  align-content: start;
   padding: clamp(16px, 2vw, 26px);
   background: #dfe6e5;
   font-family: var(--sans);
   white-space: normal;
+}
+
+.pdf-toolbar {
+  position: sticky;
+  top: 16px;
+  z-index: 12;
+  width: max-content;
+  max-width: 90%;
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border: 1px solid rgba(216, 224, 222, 0.86);
+  border-radius: 100px;
+  background: rgba(250, 252, 250, 0.95);
+  box-shadow: 0 12px 26px rgba(15, 26, 31, 0.14);
+  backdrop-filter: blur(14px);
+  margin-bottom: 8px;
+}
+
+.pdf-toolbar button,
+.page-input {
+  min-height: 36px;
+  border-radius: 100px;
+}
+
+.pdf-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: #16384f;
+  background: #e6eef0;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.pdf-toolbar svg {
+  width: 16px;
+  height: 16px;
+}
+
+.pdf-zoom-value,
+.page-count {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.page-input {
+  display: grid;
+  grid-template-columns: 16px minmax(62px, 84px) auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 9px;
+  background: #fff;
+  border: 1px solid var(--line);
+}
+
+.page-input input {
+  min-width: 0;
+  min-height: 30px;
+  border: 0;
+  padding: 0 4px;
+  background: transparent;
+  color: var(--ink);
+}
+
+.page-input button {
+  min-height: 28px;
+  padding: 0 9px;
+  color: #fff;
+  background: #16384f;
 }
 
 .pdf-loading-state {
@@ -382,11 +461,15 @@ input[type='range'] {
   color: var(--muted);
 }
 
-.pdf-page {
+.pdf-page-container {
   width: 100%;
   max-width: calc(920px * var(--pdf-zoom, 1));
-  position: relative;
   justify-self: center;
+}
+
+.pdf-page {
+  position: relative;
+  width: 100%;
   overflow: hidden;
   border-radius: 4px;
   background: #fff;
@@ -731,14 +814,53 @@ input[type='range'] {
   background: #111817;
 }
 
+.app-focus .pdf-page-container {
+  width: 100%;
+}
+
 .app-focus .pdf-page {
-  width: min(100%, 980px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.5);
+}
+
+.app-focus .pdf-toolbar {
+  transition: transform 0.3s ease, opacity 0.3s ease;
+  background: rgba(30, 40, 45, 0.85);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+}
+
+.app-focus .pdf-toolbar button {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.app-focus .pdf-toolbar .pdf-zoom-value,
+.app-focus .pdf-toolbar .page-count {
+  color: #fff;
+}
+
+.app-focus .page-input {
+  background: rgba(0, 0, 0, 0.3);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.app-focus .page-input input {
+  color: #fff;
 }
 
 .app-focus.focus-controls-hidden .focus-dock {
   opacity: 0;
   pointer-events: none;
   transform: translate(-50%, 16px);
+}
+
+.app-focus.focus-controls-hidden .pdf-toolbar {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-16px);
 }
 
 @media (max-width: 1120px) {
