@@ -1,57 +1,11 @@
 'use client'
 
 import { useCallback, useEffect, useRef } from 'react'
+import { KOKORO_VOICES, type KokoroVoiceId, isKokoroVoiceId } from '../lib/ttsVoices'
 
-export type TtsEngine = 'kokoro' | 'browser'
+export { KOKORO_VOICES, isKokoroVoiceId, type KokoroVoiceId }
 
-export const KOKORO_MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX'
-
-export const KOKORO_VOICES = [
-  {
-    id: 'af_heart',
-    label: 'Heart',
-    locale: 'American English',
-    description: 'Warm female voice, grade A',
-  },
-  {
-    id: 'af_bella',
-    label: 'Bella',
-    locale: 'American English',
-    description: 'Expressive female voice, grade A-',
-  },
-  {
-    id: 'af_nicole',
-    label: 'Nicole',
-    locale: 'American English',
-    description: 'Calm female voice, grade B-',
-  },
-  {
-    id: 'am_fenrir',
-    label: 'Fenrir',
-    locale: 'American English',
-    description: 'Steady male voice, grade C+',
-  },
-  {
-    id: 'am_michael',
-    label: 'Michael',
-    locale: 'American English',
-    description: 'Balanced male voice, grade C+',
-  },
-  {
-    id: 'bf_emma',
-    label: 'Emma',
-    locale: 'British English',
-    description: 'Clear female voice, grade B-',
-  },
-  {
-    id: 'bm_george',
-    label: 'George',
-    locale: 'British English',
-    description: 'Measured male voice, grade C',
-  },
-] as const
-
-export type KokoroVoiceId = (typeof KOKORO_VOICES)[number]['id']
+export type TtsEngine = 'local' | 'kokoro' | 'browser'
 
 export type SpeechBoundary = {
   charStart: number
@@ -90,12 +44,6 @@ type KokoroWorkerMessage =
   | { id: number; type: 'status'; message: string }
   | { id: number; type: 'audio'; audioBuffer: ArrayBuffer }
   | { id: number; type: 'error'; message: string }
-
-const KOKORO_VOICE_IDS = new Set<string>(KOKORO_VOICES.map((voice) => voice.id))
-
-export function isKokoroVoiceId(value: unknown): value is KokoroVoiceId {
-  return typeof value === 'string' && KOKORO_VOICE_IDS.has(value)
-}
 
 function isBrowserReady() {
   return typeof window !== 'undefined'
@@ -354,9 +302,29 @@ export function useTts() {
 
   const getKokoroCacheKey = useCallback(
     (request: TtsPreloadRequest) =>
-      [request.kokoroVoiceId, request.rate.toFixed(3), request.text].join('\n'),
+      [request.engine, request.kokoroVoiceId, request.rate.toFixed(3), request.text].join('\n'),
     [],
   )
+
+  const requestLocalAudio = useCallback(async (request: TtsPreloadRequest) => {
+    const response = await fetch('/api/tts/kokoro', {
+      body: JSON.stringify({
+        speed: request.rate,
+        text: request.text,
+        voice: request.kokoroVoiceId,
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    })
+
+    if (!response.ok) {
+      throw new Error(`Local TTS failed with ${response.status}`)
+    }
+
+    return response.arrayBuffer()
+  }, [])
 
   const requestKokoroAudio = useCallback(
     (
@@ -411,14 +379,21 @@ export function useTts() {
 
   const preload = useCallback(
     (request: TtsPreloadRequest) => {
-      if (!isBrowserReady() || request.engine !== 'kokoro' || !request.text.trim()) return
+      if (
+        !isBrowserReady() ||
+        (request.engine !== 'kokoro' && request.engine !== 'local') ||
+        !request.text.trim()
+      ) {
+        return
+      }
 
       const cacheKey = getKokoroCacheKey(request)
       const cache = preloadedAudioRef.current
 
       if (cache.has(cacheKey)) return
 
-      const generation = requestKokoroAudio(request)
+      const generation =
+        request.engine === 'local' ? requestLocalAudio(request) : requestKokoroAudio(request)
       cache.set(cacheKey, generation)
       void generation.catch((error) => {
         cache.delete(cacheKey)
@@ -430,7 +405,7 @@ export function useTts() {
         if (oldestKey) cache.delete(oldestKey)
       }
     },
-    [getKokoroCacheKey, requestKokoroAudio],
+    [getKokoroCacheKey, requestKokoroAudio, requestLocalAudio],
   )
 
   const speakWithBrowser = useCallback((request: TtsRequest, runId: number) => {
@@ -536,12 +511,71 @@ export function useTts() {
     ],
   )
 
+  const speakWithLocal = useCallback(
+    async (request: TtsRequest, runId: number) => {
+      if (!isBrowserReady()) {
+        request.onError()
+        return
+      }
+
+      releaseAudio()
+      window.speechSynthesis?.cancel()
+      request.onStatus('Connecting to local voice')
+
+      try {
+        const cacheKey = getKokoroCacheKey(request)
+        const cachedAudio = preloadedAudioRef.current.get(cacheKey)
+        const wavBuffer = cachedAudio ?? requestLocalAudio(request)
+        preloadedAudioRef.current.delete(cacheKey)
+        const resolvedWavBuffer = await wavBuffer
+        if (playbackRunRef.current !== runId) return
+
+        const audioContext = getAudioContext()
+
+        if (!audioContext) {
+          request.onError()
+          return
+        }
+
+        const audioBuffer = await audioContext.decodeAudioData(resolvedWavBuffer.slice(0))
+        if (playbackRunRef.current !== runId) return
+
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume()
+        }
+
+        startWebAudio(audioBuffer, 0, request, runId)
+      } catch (error) {
+        console.error('[AudioReader] Local server voice failed', error)
+
+        if (playbackRunRef.current !== runId) return
+
+        request.onStatus('Local voice unavailable; using browser voice')
+        speakWithBrowser(request, runId)
+      }
+    },
+    [
+      getAudioContext,
+      getKokoroCacheKey,
+      releaseAudio,
+      requestLocalAudio,
+      speakWithBrowser,
+      startWebAudio,
+    ],
+  )
+
   const speak = useCallback(
     (request: TtsRequest) => {
       const runId = playbackRunRef.current + 1
       playbackRunRef.current = runId
 
       stopBoundaryClock()
+
+      if (request.engine === 'local') {
+        getAudioContext()
+        void speakWithLocal(request, runId)
+        return
+      }
 
       if (request.engine === 'kokoro') {
         getAudioContext()
@@ -551,7 +585,7 @@ export function useTts() {
 
       speakWithBrowser(request, runId)
     },
-    [getAudioContext, speakWithBrowser, speakWithKokoro, stopBoundaryClock],
+    [getAudioContext, speakWithBrowser, speakWithKokoro, speakWithLocal, stopBoundaryClock],
   )
 
   useEffect(() => stop, [stop])

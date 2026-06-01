@@ -159,7 +159,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   pitch: 1,
   volume: 0.9,
   voiceURI: '',
-  ttsEngine: 'kokoro',
+  ttsEngine: 'local',
   kokoroVoiceId: 'af_heart',
   profile: 'balanced',
   focusMode: false,
@@ -212,9 +212,12 @@ const VOICE_PROFILES: Record<
 
 const CHUNK_TARGET = 1800
 const CHUNK_LIMIT = 2800
+const LOCAL_TTS_CHUNK_TARGET = 900
+const LOCAL_TTS_CHUNK_LIMIT = 1400
 const KOKORO_CHUNK_TARGET = 420
 const KOKORO_CHUNK_LIMIT = 760
 const PDF_CHUNK_WORD_LIMIT = 95
+const LOCAL_TTS_PDF_CHUNK_WORD_LIMIT = 60
 const KOKORO_PDF_CHUNK_WORD_LIMIT = 34
 const PDF_EQUATION_PAUSE_MS = 1100
 const PDF_IMPORT_YIELD_EVERY_PAGES = 3
@@ -381,7 +384,7 @@ function isReaderFont(value: unknown): value is ReaderFont {
 }
 
 function isTtsEngine(value: unknown): value is TtsEngine {
-  return value === 'kokoro' || value === 'browser'
+  return value === 'local' || value === 'kokoro' || value === 'browser'
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number) {
@@ -1066,11 +1069,15 @@ function App() {
   const selectedKokoroVoice =
     KOKORO_VOICES.find((voice) => voice.id === settings.kokoroVoiceId) ?? KOKORO_VOICES[0]
   const selectedVoiceValue =
-    settings.ttsEngine === 'kokoro'
+    settings.ttsEngine === 'local'
+      ? `local:${settings.kokoroVoiceId}`
+      : settings.ttsEngine === 'kokoro'
       ? `kokoro:${settings.kokoroVoiceId}`
       : `browser:${settings.voiceURI}`
   const selectedVoiceLabel =
-    settings.ttsEngine === 'kokoro'
+    settings.ttsEngine === 'local'
+      ? `${selectedKokoroVoice.label} local (${selectedKokoroVoice.locale})`
+      : settings.ttsEngine === 'kokoro'
       ? `${selectedKokoroVoice.label} (${selectedKokoroVoice.locale})`
       : (selectedVoice?.name ?? 'Default voice')
   const filteredBookmarks = bookmarks.filter((bookmark) => bookmark.id.startsWith(`${book.id}:`))
@@ -1319,7 +1326,11 @@ function App() {
 
         const chunk = buildPdfSpeechChunk(
           safeWordIndex,
-          settings.ttsEngine === 'kokoro' ? KOKORO_PDF_CHUNK_WORD_LIMIT : PDF_CHUNK_WORD_LIMIT,
+          settings.ttsEngine === 'local'
+            ? LOCAL_TTS_PDF_CHUNK_WORD_LIMIT
+            : settings.ttsEngine === 'kokoro'
+              ? KOKORO_PDF_CHUNK_WORD_LIMIT
+              : PDF_CHUNK_WORD_LIMIT,
         )
 
         if (!chunk.text.trim()) {
@@ -1374,13 +1385,18 @@ function App() {
           onStatus: setStatus,
         })
 
-        if (settings.ttsEngine === 'kokoro' && chunk.nextWordIndex < words.length) {
-          const nextChunk = buildPdfSpeechChunk(chunk.nextWordIndex, KOKORO_PDF_CHUNK_WORD_LIMIT)
+        if (settings.ttsEngine !== 'browser' && chunk.nextWordIndex < words.length) {
+          const nextChunk = buildPdfSpeechChunk(
+            chunk.nextWordIndex,
+            settings.ttsEngine === 'local'
+              ? LOCAL_TTS_PDF_CHUNK_WORD_LIMIT
+              : KOKORO_PDF_CHUNK_WORD_LIMIT,
+          )
 
           if (nextChunk.text.trim()) {
             preloadTts({
               text: nextChunk.text,
-              engine: 'kokoro',
+              engine: settings.ttsEngine,
               rate: settings.rate,
               kokoroVoiceId: settings.kokoroVoiceId,
             })
@@ -1392,8 +1408,10 @@ function App() {
 
       const startChar = words[safeWordIndex]?.start ?? 0
       const chunk =
-        settings.ttsEngine === 'kokoro'
-          ? getChunk(book.text, startChar, KOKORO_CHUNK_TARGET, KOKORO_CHUNK_LIMIT)
+        settings.ttsEngine === 'local'
+          ? getChunk(book.text, startChar, LOCAL_TTS_CHUNK_TARGET, LOCAL_TTS_CHUNK_LIMIT)
+          : settings.ttsEngine === 'kokoro'
+            ? getChunk(book.text, startChar, KOKORO_CHUNK_TARGET, KOKORO_CHUNK_LIMIT)
           : getChunk(book.text, startChar)
 
       if (!chunk.trim()) {
@@ -1446,23 +1464,21 @@ function App() {
         onStatus: setStatus,
       })
 
-      if (settings.ttsEngine === 'kokoro') {
+      if (settings.ttsEngine !== 'browser') {
         const nextChar = startChar + chunk.length
         const nextWordIndex = findWordIndexFromChar(words, nextChar + 1)
 
         if (nextWordIndex < words.length - 1 && nextChar < book.text.length - 1) {
           const nextStartChar = words[nextWordIndex]?.start ?? nextChar
-          const nextChunk = getChunk(
-            book.text,
-            nextStartChar,
-            KOKORO_CHUNK_TARGET,
-            KOKORO_CHUNK_LIMIT,
-          )
+          const nextChunk =
+            settings.ttsEngine === 'local'
+              ? getChunk(book.text, nextStartChar, LOCAL_TTS_CHUNK_TARGET, LOCAL_TTS_CHUNK_LIMIT)
+              : getChunk(book.text, nextStartChar, KOKORO_CHUNK_TARGET, KOKORO_CHUNK_LIMIT)
 
           if (nextChunk.trim()) {
             preloadTts({
               text: nextChunk,
-              engine: 'kokoro',
+              engine: settings.ttsEngine,
               rate: settings.rate,
               kokoroVoiceId: settings.kokoroVoiceId,
             })
@@ -1717,6 +1733,17 @@ function App() {
       }
     }
   }, [revealFocusControls, settings.focusMode])
+
+  useEffect(() => {
+    if (settings.ttsEngine !== 'local') return
+
+    preloadTts({
+      text: 'Ready.',
+      engine: 'local',
+      rate: settings.rate,
+      kokoroVoiceId: settings.kokoroVoiceId,
+    })
+  }, [preloadTts, settings.kokoroVoiceId, settings.rate, settings.ttsEngine])
 
   useEffect(() => {
     const updateVoices = () => {
@@ -2515,6 +2542,19 @@ function App() {
               onChange={(event) => {
                 const value = event.target.value
 
+                if (value.startsWith('local:')) {
+                  const voiceId = value.slice('local:'.length)
+
+                  if (!isKokoroVoiceId(voiceId)) return
+
+                  setSettings((current) => ({
+                    ...current,
+                    ttsEngine: 'local',
+                    kokoroVoiceId: voiceId,
+                  }))
+                  return
+                }
+
                 if (value.startsWith('kokoro:')) {
                   const voiceId = value.slice('kokoro:'.length)
 
@@ -2535,7 +2575,14 @@ function App() {
                 }))
               }}
             >
-              <optgroup label="Local AI voices">
+              <optgroup label="Local server voices">
+                {KOKORO_VOICES.map((voice) => (
+                  <option value={`local:${voice.id}`} key={voice.id}>
+                    {voice.label} ({voice.locale}) - {voice.description}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Browser AI voices">
                 {KOKORO_VOICES.map((voice) => (
                   <option value={`kokoro:${voice.id}`} key={voice.id}>
                     {voice.label} ({voice.locale}) - {voice.description}
